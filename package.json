@@ -1,0 +1,15 @@
+{
+  "name": "deepai-code-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible reverse-proxy gateway for the DeepAI Code managed model lane",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "models": "node src/index.mjs --list-models",
+    "smoke": "node tests/smoke.mjs"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": { "undici": "^7.0.0" }
+}

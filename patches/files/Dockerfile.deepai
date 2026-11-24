@@ -1,0 +1,20 @@
+# DeepAI Code provider overlay image.
+#
+# The fork is small: one new router, two lines in main.py, and a settings page in
+# the prebuilt frontend. So instead of rebuilding Open WebUI from source inside
+# the container (3 GB of Python deps + a full npm install), this image starts
+# from the version-locked upstream image and overlays only the fork's files.
+#
+# Version pinning matters: the frontend in `build/` was compiled from the same
+# 0.13.4 source tree as this base image, so the backend and the static site stay
+# in sync. Rebuilding from source is documented in DEEPAI_FORK.md for when the
+# version moves.
+FROM ghcr.io/open-webui/open-webui:v0.13.4
+
+# --- backend fork: the DeepAI provider router + its registration -------------
+COPY backend/open_webui/routers/deepai.py /app/backend/open_webui/routers/deepai.py
+COPY backend/open_webui/main.py /app/backend/open_webui/main.py
+
+# --- frontend fork: the static site built from this checkout -----------------
+# `npm run build` output; contains the admin "DeepAI Code" settings page.
+COPY build /app/build

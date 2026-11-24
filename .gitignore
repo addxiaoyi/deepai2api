@@ -1,0 +1,30 @@
+# 依赖与产物
+node_modules/
+vendor/
+_re/
+
+# 网关运行时状态（含账号 api_key 与 Key 哈希，绝不能提交）
+data/
+*.tmp
+
+# 本地配置与临时凭据
+.env
+.owui-token
+.oauth-url
+.smoke-key
+.tmpdata/
+
+# 日志
+*.log
+
+# 构建产物
+vendor/open-webui/build/
+vendor/open-webui/.svelte-kit/
+vendor/open-webui/frontend/
+vendor/open-webui/.venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

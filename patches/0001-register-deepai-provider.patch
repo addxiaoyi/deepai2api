@@ -1,0 +1,75 @@
+diff --git a/backend/open_webui/main.py b/backend/open_webui/main.py
+index 572fde9..cf82a68 100644
+--- a/backend/open_webui/main.py
++++ b/backend/open_webui/main.py
+@@ -159,6 +159,7 @@ from open_webui.routers import (
+     chats,
+     comments,
+     configs,
++    deepai,
+     evaluations,
+     files,
+     folders,
+@@ -825,6 +826,7 @@ app.include_router(audio.router, prefix='/api/v1/audio', tags=['audio'])
+ app.include_router(retrieval.router, prefix='/api/v1/retrieval', tags=['retrieval'])
+ 
+ app.include_router(configs.router, prefix='/api/v1/configs', tags=['configs'])
++app.include_router(deepai.router, prefix='/api/v1/deepai', tags=['deepai'])
+ 
+ from open_webui.env import UVICORN_WORKERS, REDIS_URL
+ from open_webui.routers import tether
+diff --git a/src/lib/components/admin/Settings/AdminTabIcon.svelte b/src/lib/components/admin/Settings/AdminTabIcon.svelte
+index f40a25f..b6fcd39 100644
+--- a/src/lib/components/admin/Settings/AdminTabIcon.svelte
++++ b/src/lib/components/admin/Settings/AdminTabIcon.svelte
+@@ -27,6 +27,8 @@
+ 	<Lock {className} {strokeWidth} />
+ {:else if id === 'connections'}
+ 	<Link {className} {strokeWidth} />
++{:else if id === 'deepai'}
++	<GlobeAlt {className} {strokeWidth} />
+ {:else if id === 'models'}
+ 	<svg
+ 		aria-hidden="true"
+diff --git a/src/lib/components/chat/SettingsModal.svelte b/src/lib/components/chat/SettingsModal.svelte
+index 1ebc2c6..c47b399 100644
+--- a/src/lib/components/chat/SettingsModal.svelte
++++ b/src/lib/components/chat/SettingsModal.svelte
+@@ -43,6 +43,7 @@
+ 	import AdminGeneral from '$lib/components/admin/Settings/General.svelte';
+ 	import AdminAuthentication from '$lib/components/admin/Settings/Authentication.svelte';
+ 	import AdminConnections from '$lib/components/admin/Settings/Connections.svelte';
++	import AdminDeepAI from '$lib/components/admin/Settings/DeepAI.svelte';
+ 	import AdminModels from '$lib/components/admin/Settings/Models.svelte';
+ 	import AdminSubagents from '$lib/components/admin/Settings/Subagents.svelte';
+ 	import AdminEvaluations from '$lib/components/admin/Settings/Evaluations.svelte';
+@@ -160,6 +161,7 @@
+ 		'admin:authentication': $i18n.t('System'),
+ 		'admin:interface': $i18n.t('System'),
+ 		'admin:connections': $i18n.t('AI'),
++		'admin:deepai': $i18n.t('AI'),
+ 		'admin:models': $i18n.t('AI'),
+ 		'admin:subagents': $i18n.t('AI'),
+ 		'admin:integrations': $i18n.t('Tools'),
+@@ -280,6 +282,12 @@
+ 			title: $i18n.t('settings.admin.connections.title'),
+ 			searchPrefixes: ['settings.admin.connections.']
+ 		},
++		{
++			id: 'admin:deepai',
++			titleKey: 'settings.admin.deepai.title',
++			title: $i18n.t('DeepAI Code'),
++			searchPrefixes: ['settings.admin.deepai.']
++		},
+ 		{
+ 			id: 'admin:models',
+ 			titleKey: 'settings.admin.models.title',
+@@ -854,6 +862,8 @@
+ 						toast.success($i18n.t('Settings saved successfully!'));
+ 					}}
+ 				/>
++			{:else if selectedTab === 'admin:deepai'}
++				<AdminDeepAI saveHandler={adminConfigSaveHandler} />
+ 			{:else if selectedTab === 'admin:models'}
+ 				<AdminModels bind:tabState />
+ 			{:else if selectedTab === 'admin:subagents'}

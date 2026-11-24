@@ -1,0 +1,15 @@
+# 补丁和脚本按 LF 存储，否则在 Windows 上重新克隆后 git apply 会失败
+*.patch text eol=lf
+*.sh    text eol=lf
+*.mjs   text eol=lf
+*.ts    text eol=lf
+*.svelte text eol=lf
+*.py    text eol=lf
+
+# PowerShell 保留 CRLF 更稳
+*.ps1   text eol=crlf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.ico   binary

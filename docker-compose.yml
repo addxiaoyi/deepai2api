@@ -1,0 +1,47 @@
+# OpenWebUI + DeepAI Code Gateway（二次开发版）
+#
+# 与上一版的区别：**不再拉官方镜像，而是构建 vendor/open-webui 这个 fork**
+# —— 前端就是 Open WebUI 本体，只在它的管理设置里新增了「DeepAI Code」页。
+#
+# 用法：
+#   docker compose up -d --build
+#   打开 http://localhost:3000 ，首个注册的账号是管理员
+#   设置 → Admin → DeepAI Code：填网关地址 + 管理口令 → 登录账号 → 创建 Key → 接入
+
+services:
+  openwebui:
+    build:
+      context: ./vendor/open-webui
+      dockerfile: Dockerfile.deepai
+    image: deepai-openwebui:local
+    container_name: deepai-openwebui
+    ports:
+      - "${OPENWEBUI_PORT:-3000}:8080"
+    environment:
+      # 网关地址：容器里访问宿主机，必须用 host.docker.internal，
+      # 且网关需要用 --host 0.0.0.0 启动
+      - DEEPAI_GATEWAY_URL=${DEEPAI_GATEWAY_URL:-http://host.docker.internal:8787}
+      # 网关管理口令（网关启动时打印；也可稍后在 DeepAI 设置页里填）
+      - DEEPAI_GATEWAY_TOKEN=${DEEPAI_GATEWAY_TOKEN:-}
+      # Open WebUI 自身的 OpenAI 通道保持开启，fork 的「接入」按钮会往里写连接
+      - ENABLE_OPENAI_API=true
+      - ENABLE_SIGNUP=true
+      - DEFAULT_USER_ROLE=pending
+      - WEBUI_NAME=DeepAI Code
+      - WEBUI_AUTH=true
+      - ENABLE_STREAMING=true
+      # 启动时不要下载 embedding 模型（会卡住首启）；RAG 用不上，聊天不受影响
+      - OFFLINE_MODE=true
+      - RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
+      - HF_ENDPOINT=https://hf-mirror.com
+      - AIOHTTP_CLIENT_TIMEOUT=600
+      - AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST=30
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - openwebui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  openwebui-data:
+
