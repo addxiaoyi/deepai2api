@@ -22,18 +22,27 @@ OAuth 登录订阅账号 → 铸造 OpenAI 兼容 API Key → 给任意工具用
 ## 1. 快速开始
 
 ```powershell
-cd D:\qwq\项目\deepaiapi
+git clone https://github.com/addxiaoyi/deepai2api.git
+cd deepai2api
 npm install
 
-# 网关（只提供 API，没有自带 UI）
+# 1) 拉取 Open WebUI 0.13.4 并套用 DeepAI provider（克隆 + 打补丁 + 构建前端）
+.\scripts\apply-fork.ps1
+
+# 2) 网关（只提供 API，没有自带 UI）
 node src\index.mjs --host 0.0.0.0 --port 8787
 
-# 界面 = Open WebUI fork（构建 overlay 镜像，秒级）
+# 3) 界面 = Open WebUI fork（overlay 镜像，秒级构建）
 docker compose up -d --build
 ```
 
 打开 **http://localhost:3000** → 注册管理员 → **设置 → Admin → DeepAI Code** →
 填网关地址/口令 → 登录 DeepAI → 创建 Key → **接入并启用模型**。
+
+> `vendor/` 不入库（约 1.9 GB）。`scripts/apply-fork.ps1` 负责把它还原出来：
+> 克隆固定 tag → `git apply patches/0001-register-deepai-provider.patch` →
+> 复制 `patches/files/` 里的新增文件 → `npm run build`。
+> 升级 Open WebUI 时改 `-Ref` 参数即可，冲突会明确报出来。
 
 > 网关的 `/` 不再是管理页面：设了 `DEEPAI_WEBUI_URL`（如 `http://127.0.0.1:3000`）
 > 就会 302 跳到 Open WebUI，否则只显示一张说明卡片。界面只有 Open WebUI 一处。
@@ -166,7 +175,10 @@ src/
   keys.mjs        sk-dcg-… 铸造与哈希
 
   config/credentials/machine/dispatcher/semaphore
-vendor/open-webui  Open WebUI 0.13.4 + DeepAI provider（二次开发）
+patches/
+  0001-register-deepai-provider.patch   对上游的 14 行改动
+  files/                                新增的 4 个文件 + overlay Dockerfile
+vendor/open-webui                      由 apply-fork.ps1 还原（不入库）
 tests/
   e2e.mjs         27 项，打 mock 上游，不碰真实账号
   smoke.mjs       真实上游冒烟
@@ -175,7 +187,7 @@ scripts/
   openwebui.ps1   构建/启动 fork
   screenshot.mjs  headless Chrome 截图 + 渲染后 DOM 快照
 docker-compose.yml  overlay 镜像（官方 v0.13.4 + 我们的后端/前端文件）
-vendor/open-webui/Dockerfile.deepai   overlay 构建文件
+scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 ```
 
 ---
@@ -202,7 +214,7 @@ Anthropic message，含 `thinking` block）、`/v1/search`、`/v1/models`（28 �
 | 局域网 IP 访问超时 | Windows 系统代理把该网段也代理了，用 `-NoProxy` 试 |
 | `docker compose` 连不上 | Docker Desktop 没启动（CLI 在也没用） |
 | `npm ci` 报 EBADENGINE | Node >22，加 `--engine-strict=false` |
-| 设置页看不到 | fork 没构建：`cd vendor/open-webui && npm run build`，或 `docker compose up -d --build` |
+| 设置页看不到 | fork 没还原：先跑 `.\scripts\apply-fork.ps1`，再 `docker compose up -d --build` |
 | 模型列表为空 | 网关没连账号；DeepAI 设置页先 OAuth 登录，再点「接入并启用模型」 |
 | 429 `rate_limit` | 该 Key 触发了 rpm/日限额；管理台改限额或换 Key |
 
@@ -215,3 +227,4 @@ Anthropic message，含 `thinking` block）、`/v1/search`、`/v1/models`（28 �
   `theos_exhausted`、`session_busy` …），不吞消息；账号级拒绝会标记账号并切换。
 - `data/gateway-state.json` 存账号 api_key 与 Key 哈希（0600）。管理口令默认自动生成，暴露前请换强口令。
 - 这是对本机、自己账号的通道复用；DeepAI 服务条款第 4 条限制第三方应用接入，使用范围自行评估。
+
