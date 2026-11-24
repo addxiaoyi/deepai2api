@@ -430,14 +430,15 @@
 	<div class="rounded-xl border border-gray-100 p-4 dark:border-gray-800">
 		<div class="mb-1 font-medium">接到 Open WebUI</div>
 		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
-			自动新建一个 Key 并写进「设置 → 连接」，模型列表里随即出现 DeepAI 的全部模型。
+			首次打开本页时已自动接入并生成 Key，模型列表里应当直接出现 DeepAI 的全部模型。
+		如果换了网关或删掉了 Key，点下面的按钮重新同步一次。
 		</div>
 		<button
 			class="rounded-lg bg-black px-3 py-1.5 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-black"
 			on:click={connect}
 			disabled={busy === 'connect' || !status?.reachable}
 		>
-			接入并启用模型
+			重新同步接入
 		</button>
 	</div>
 
@@ -478,4 +479,5 @@
 		<div class="text-xs text-gray-500 dark:text-gray-400">加载中…</div>
 	{/if}
 </div>
+
 

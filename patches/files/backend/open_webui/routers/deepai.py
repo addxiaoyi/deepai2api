@@ -134,8 +134,56 @@ class ConnectForm(BaseModel):
 # --------------------------------------------------------------------- routes
 
 
+async def ensure_connection(request: Request, api_key: Optional[str] = None) -> Optional[str]:
+    """
+    Make sure the gateway is registered as an [OI] connection, minting a key if
+    needed. Called by /status so the models appear without the operator having to
+    press "connect" first — that button only re-syncs after a manual change.
+    """
+    base = await get_gateway_url()
+    api_base = f"{base}/v1"
+
+    values = await Config.get_many("openai.api_base_urls", "openai.api_keys", "openai.api_configs")
+    urls = list(values.get("openai.api_base_urls") or [])
+    keys = list(values.get("openai.api_keys") or [])
+    configs = dict(values.get("openai.api_configs") or {})
+
+    if api_base in urls:
+        index = urls.index(api_base)
+        current = keys[index] if index < len(keys) else ""
+        if current and not api_key:
+            return None  # already wired and working
+    else:
+        index = len(urls)
+
+    if not api_key:
+        created = await gw("/api/admin/keys", method="POST", json_body={"label": "openwebui"})
+        api_key = created.get("key")
+        if not api_key:
+            return None
+
+    while len(keys) <= index:
+        keys.append("")
+    keys[index] = api_key
+    if api_base not in urls:
+        urls.append(api_base)
+    configs[str(index)] = {"enable": True, "tags": [DEEPAI_PROVIDER_TAG]}
+
+    await Config.upsert(
+        {
+            "openai.enable": True,
+            "openai.api_base_urls": urls,
+            "openai.api_keys": keys,
+            "openai.api_configs": configs,
+        }
+    )
+    await clear_models_cache(request)
+    log.info("DeepAI gateway auto-connected to Open WebUI at %s", api_base)
+    return api_base
+
+
 @router.get("/status")
-async def get_status(user=Depends(get_admin_user)):
+async def get_status(request: Request, user=Depends(get_admin_user)):
     """Everything the settings page needs, in one round trip."""
     base = await get_gateway_url()
     has_token = bool(await admin_headers_token())
@@ -148,6 +196,7 @@ async def get_status(user=Depends(get_admin_user)):
     except HTTPException as exc:
         error = exc.detail
 
+    connected = False
     if has_token and health:
         try:
             state = await gw("/api/admin/state", timeout=90)
@@ -156,10 +205,18 @@ async def get_status(user=Depends(get_admin_user)):
             if not error:
                 error = exc.detail
 
+    if state and (state.get("accounts") or []):
+        # Auto-wire on first view so models show up without a manual click.
+        try:
+            connected = (await ensure_connection(request)) is not None
+        except HTTPException as exc:
+            log.warning("auto-connect failed: %s", exc.detail)
+
     return {
         "gateway_url": base,
         "has_admin_token": has_token,
         "reachable": health is not None,
+        "connected": connected,
         "error": error,
         "health": health,
         "state": state,
@@ -232,44 +289,17 @@ async def connect_to_openwebui(request: Request, form_data: ConnectForm, user=De
     Register the gateway as an OpenAI-compatible connection in Open WebUI so the
     DeepAI models show up in the model picker without any manual setup.
     """
-    base = await get_gateway_url()
-    api_base = f"{base}/v1"
-
-    if form_data.key:
-        api_key = form_data.key
-    else:
+    api_key = form_data.key
+    if not api_key:
         created = await gw("/api/admin/keys", method="POST", json_body={"label": "openwebui"})
         api_key = created.get("key")
         if not api_key:
             raise GatewayError(502, "网关没有返回 API Key。")
 
-    values = await Config.get_many("openai.api_base_urls", "openai.api_keys", "openai.api_configs")
+    api_base = await ensure_connection(request, api_key=api_key)
+    values = await Config.get_many("openai.api_base_urls")
     urls = list(values.get("openai.api_base_urls") or [])
-    keys = list(values.get("openai.api_keys") or [])
-    configs = dict(values.get("openai.api_configs") or {})
-
-    if api_base in urls:
-        index = urls.index(api_base)
-        while len(keys) <= index:
-            keys.append("")
-        keys[index] = api_key
-    else:
-        urls.append(api_base)
-        keys.append(api_key)
-        configs[str(len(urls) - 1)] = {"enable": True, "tags": [DEEPAI_PROVIDER_TAG]}
-
-    await Config.upsert(
-        {
-            "openai.enable": True,
-            "openai.api_base_urls": urls,
-            "openai.api_keys": keys,
-            "openai.api_configs": configs,
-        }
-    )
-    await clear_models_cache(request)
-
-    log.info("DeepAI gateway connected to Open WebUI at %s", api_base)
-    return {"api_base": api_base, "key_prefix": api_key[:12] + "…", "connections": len(urls)}
+    return {"api_base": api_base or f"{await get_gateway_url()}/v1", "key_prefix": api_key[:12] + "…", "connections": len(urls)}
 
 
 @router.get("/models")
