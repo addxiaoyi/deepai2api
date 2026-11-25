@@ -532,6 +532,236 @@ curl -sS http://127.0.0.1:8787/p/moonai/v1/chat/completions \
 
 ---
 
+## 3.60 Clever AI Hub 号池（注册机 + 反代出 Key）
+
+第五条独立的号池线：**cleverai.app（Clever AI Hub）**。它比前面几条多一道门：
+业务面强制 **Firebase App Check**，没有 `X-Firebase-AppCheck` 一律 401。
+
+```
+注册机(tools/cleverai-reg)            网关                               cleverai
+ 协议腿 httpx ──┐        /api/admin/cleverai/pool/import   identitytoolkit(注册)
+ 浏览器腿 ──────┴NDJSON──▶ data/cleverai-pool.json ─┐            api.cleverai.app(业务)
+                              │                     │            omni/response(聊天)
+                              │                     └ sk-dcg-… ──▶ /cleverai/v1/*
+                              └─ App Check 令牌缓存/续期 + refreshToken 换 idToken
+```
+
+| 维度 | 说明 |
+| --- | --- |
+| 认证 | Firebase（`identitytoolkit`），邮箱+密码注册 |
+| 调模型凭据 | Firebase **`refreshToken`**（长期）+ `idToken`（缓存）；**没有面板 api key** |
+| 人机校验 | reCAPTCHA Enterprise → **App Check JWT**（3600s，绑应用安装，整批共用） |
+| 上游协议 | 自有 `omni` 信封 + SSE，内容项 `text` / `tool_call` / `tool_result` |
+| 免费额度 | 每账号 75 credit（30 每日 + 45 欢迎） |
+| 引擎 | 94 个（`/configs?type=engines`），默认 `openai-gpt-6-luna`（2 credit） |
+
+### 三条命令
+
+```powershell
+# 1) 注册（协议腿 + 域名邮箱；App Check 由浏览器取一次，整批复用）
+node src/cleverai-cli.mjs register -n 10 -c 1 --mail-provider imap --mail-domain example.com
+
+# 2) 看号池 / 试用一个账号
+node src/cleverai-cli.mjs pool
+node src/cleverai-cli.mjs chat --model openai-gpt-6-luna --prompt "hi"
+
+# 3) 导出（jsonl / csv / pool）
+node src/cleverai-cli.mjs export --format pool
+```
+
+### 双引擎
+
+| `--engine` | 行为 |
+| --- | --- |
+| `protocol` | Firebase 注册 + appserver 建号，纯 HTTP；只借浏览器的一枚 App Check 令牌 |
+| `browser` | Camoufox 打开真实站点，在页面上下文里完成注册（reCAPTCHA/App Check 原生） |
+| `auto`（默认） | 先协议；被 `blocked` / `captcha_required` / `app_check_required` 挡下切浏览器 |
+
+指纹内核：**Camoufox** / **Patchright** / Playwright，或 `--cdp` 接管
+AdsPower / BitBrowser / Morelogin 的 profile；时区语言跟随出口（`geoip`）。
+
+### 域名邮箱
+
+`imap`（自有 catch-all，**推荐**）/ `fixed`（`+tag` 分号）/ `mailtm` /
+`tempmail_lol`。公共临时域名被 Firebase 风控的速度以小时计，批跑必须用自有域。
+
+### 防封
+
+| 参数 | 作用 |
+| --- | --- |
+| `per_proxy_concurrency: 1` | 同一出口同时只跑一个注册 |
+| `min_delay` / `max_delay` | 账号间随机间隔（25–70s） |
+| `per_domain_burst: 5` + `domain_cooldown: 900` | 每域成功 5 个就换域，被打回冷却 15 分钟 |
+| `max_failures_per_proxy` + `proxy_cooldown` | 出口连续失败 3 次冷却 30 分钟 |
+| `warmup: true` | 注册后先聊一句再入池，避免静默号 |
+
+### 反代出 Key（编程工具直接能用的那部分）
+
+```
+GET  /cleverai/v1/models
+POST /cleverai/v1/chat/completions     ← Cline / Roo / Continue / OpenAI SDK
+GET  /cleverai/v1/usage
+```
+
+```bash
+curl -sS http://127.0.0.1:8787/cleverai/v1/chat/completions \
+  -H "Authorization: Bearer sk-dcg-…" -H "Content-Type: application/json" \
+  -d '{"model":"cleverai/default","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+**工具调用**：上游的 `options.tools[]` 与 `tool_call`/`tool_result` 内容项与 OpenAI 的
+`tools[]` / `tool_calls` / `role:"tool"` 双向翻译，`finish_reason` 正确落到
+`tool_calls`，流式按 `arguments` 增量切片 —— 所以依赖原生 function calling 的编程客户端
+可以直接用。失败按 `APP_CHECK` / 401 / 429 / `no credit` 分级冷却并换号。
+
+### 管理接口
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/admin/cleverai/status` | job + 号池 + relay（App Check 是否就绪） |
+| `POST /api/admin/cleverai/register` | 起批量注册（`count`/`concurrency`/`engine`/`mailProvider`/`mailDomains[]`/`appcheck`/`proxies[]`） |
+| `POST /api/admin/cleverai/register/stop` | 停任务（Windows 整棵进程树） |
+| `GET /api/admin/cleverai/pool` | 号池脱敏视图（令牌只报预览与过期时间） |
+| `POST /api/admin/cleverai/pool/import` | worker 回推 / 手工入池（按 refreshToken→email 幂等） |
+| `POST /api/admin/cleverai/pool/:id/health` | 回报调用结果（计数 + 冷却） |
+| `DELETE /api/admin/cleverai/pool/:id` | 移除账号 |
+| `POST /api/admin/cleverai/pool/export?format=jsonl\|csv\|pool` | 统一导出 |
+| `POST /api/admin/cleverai/appcheck` | 立刻续期一枚 App Check 令牌 |
+| `GET /api/admin/cleverai/keys` | 每个账号的网关 Key 前缀 + 钱包 |
+
+### 与现有模块的关系（互不冲突）
+
+| 资源 | cleverai | 其它号池线 |
+| --- | --- | --- |
+| 号池文件 | `data/cleverai-pool.json` | `gateway-state.json` / `allmodels-pool.json` / `poe-pool.json` / `<provider>-pool.json` |
+| schema | `dcg.pool/cleverai@1` | `dcg.pool/allmodels@1`、`dcg.pool/moonai@1` 等 |
+| job 状态 | `data/cleverai-register-job.json` | 同名规则，各自一份 |
+| worker | `tools/cleverai-reg/cleverai_reg`（`-m cleverai_reg`） | `tools/<provider>-reg` |
+| 路由 | `/cleverai/v1/*`、`/api/admin/cleverai/*` | `/v1/*`、`/p/<provider>/v1/*`、`/api/poe/*` |
+
+三条反代面（DeepAI `/v1/*`、provider `/p/*`、cleverai `/cleverai/v1/*`）鉴权都用
+`sk-dcg-` Key，但落到不同上游与不同号池，互不影响。
+
+### 测试
+
+| 用例 | 结果 |
+| --- | --- |
+| `node --test tests/cleverai-pool.test.mjs`（号池协议 + 工具翻译 + SSE 工具帧） | 14/14 |
+| `node --test tests/cleverai-routes.test.mjs`（管理面 + 反代面 + 不冲突） | 8/8 |
+| `python -m pytest tools/cleverai-reg/tests -q`（协议离线，MockTransport） | 20/20 |
+
+协议取证与字段定义见 [`docs/CLEVERAI-POOL.md`](docs/CLEVERAI-POOL.md)，worker 用法见
+[`tools/cleverai-reg/README.md`](tools/cleverai-reg/README.md)。
+
+---
+
+## 3.61 Blackbox AI 号池（Google OAuth 注册 + 反代出 Key）
+
+第五条 provider 线：**blackbox.ai（BLACKBOX AI，#1 AI Coding Agent）**。它的形态和
+前面几条都不同，所以单独说明：
+
+```
+注册机(tools/blackbox-reg)                     网关                                  上游
+  协议腿（会话/授权码）─┐        /api/admin/providers/blackbox/pool/import     app.blackbox.ai (Auth.js)
+  指纹浏览器腿 ─────────┴─ NDJSON ─▶ data/blackbox-pool.json ─┐                 accounts.google.com (OAuth)
+                                                           │                 enterprise.blackbox.ai (推理)
+                                                   sk-dcg-… ─▶ /p/blackbox/v1/*
+```
+
+### 为什么是"Google OAuth 注册"
+
+线上实测（取证表见 [`docs/BLACKBOX-POOL.md`](docs/BLACKBOX-POOL.md)）：
+
+- `GET /api/auth/providers` 只返回 `google`；
+- `POST /api/auth/sign-up/email` 三种 body 组合都回 `400 "Bad request."` —— **没有邮箱密码注册**；
+- `POST /api/auth/signin/google` + `csrfToken` → `302` 到
+  `accounts.google.com/o/oauth2/v2/auth?client_id=985058387028-…&code_challenge_method=S256`；
+- 授权回跳落地 `__Secure-authjs.session-token`；面板签发 `sk-…` Key；
+- 推理入口是 `https://enterprise.blackbox.ai`（`/chat/completions` 与 `/v1/chat/completions`），
+  `api.blackbox.ai` 已是 404 空壳，`chat.blackboxcli.ai` 的设备码 OAuth 已 NXDOMAIN。
+
+所以"域名邮箱"在这里是**身份来源**（Google 账号 + 自有域 catch-all 收安全邮件），
+不是注册表单字段。
+
+### 三条腿
+
+| `--engine` | 需要 | 说明 |
+| --- | --- | --- |
+| `protocol` | `--session-file`（app 会话）/ `--google-cookies` / `--authorization-code` | 最快；一次授权后可长期复用会话 |
+| `browser` | `--google-pool` + camoufox/patchright/playwright | 真点一遍 Google 登录，最稳 |
+| `auto`（默认） | 两者 | 协议先上，遇 `session_expired`/`oauth_denied`/`no_api_key`/`blocked` 自动切浏览器 |
+| `console` | work email + Turnstile | GPU Console 的 Email OTP 腿，仅当公司已开通 |
+
+```powershell
+# 网关
+node src\index.mjs --port 8787 --token <口令>
+
+# 协议腿：复用浏览器里导出的 app 会话
+cd tools\blackbox-reg
+python -m blackbox_reg doctor --mail-provider domain --mail-domains own.example.com
+python -m blackbox_reg run -n 5 -c 2 --engine protocol --session-file cookies.json `
+  --push-url http://127.0.0.1:8787 --push-token <口令> --json
+
+# 浏览器腿：真跑 Google 登录
+python -m blackbox_reg run -n 3 -c 1 --engine browser --browser-stack camoufox `
+  --google-pool google.jsonl --mail-provider domain --mail-domains own.example.com --headful
+```
+
+### 面板 Key：候选探测 + 命中即缓存
+
+面板 Key 接口没有公开文档，worker 按
+`/api/keys`、`/api/v1/keys`、`/api/user/api-keys`、`/api/agent-api/keys` … 逐个试，
+命中后写进 `data/blackbox-reg/key-endpoints.json` 复用；也可 `--keys-path` /
+`--keys-create-path` 指定。浏览器腿则直接从 `/dashboard`、`/keys` 页面读 `sk-…`。
+
+### 反代（编程工具直接用）
+
+```bash
+Base URL : http://127.0.0.1:8787/p/blackbox/v1
+API Key  : sk-dcg-…            # /api/admin/providers/blackbox/pool 里每个号的 gatewayKey
+Model    : blackboxai/blackbox-pro
+```
+
+- OpenAI：`/p/blackbox/v1/chat/completions`（`stream`、`tools`、`tool_calls` 原样透传）
+- Anthropic：`/p/blackbox/v1/messages`（relay 翻成 chat 再翻回来）
+- 模型列表：`/p/blackbox/v1/models`（上游没有 `/models`，走描述符白名单）
+- 管理面：`/api/admin/providers/blackbox/{register,pool,keys,probe}`
+
+### 与其它模块的边界
+
+| 资源 | blackbox | 其它 |
+| --- | --- | --- |
+| 号池 | `data/blackbox-pool.json`（`dcg.pool/blackbox@1`） | `<provider>-pool.json` |
+| 锁 / job | `data/blackbox-register.lock` / `-register-job.json` | 每个 provider 一份 |
+| 路由 | `/p/blackbox/v1/*`、`/api/admin/providers/blackbox/*` | `/v1/*`、`/api/admin/allmodels/*`、`/api/poe/*` |
+| 环境变量 | `BLACKBOX_*`（`BLACKBOX_GOOGLE_POOL`、`BLACKBOX_IMAP_*`、`BLACKBOX_API_BASE`…） | `DEEPAI_*` / `ALLMODELS_*` / `MOONAI_*` |
+| worker | `tools/blackbox-reg`（`python -m blackbox_reg`） | `tools/<provider>-reg` |
+
+### 客户端逆向与运行环境模拟
+
+CLI（`@blackbox_ai/blackbox-cli` 1.0.2）已下载并逆向：配置目录 `~/.blackboxcli/`、
+`security.auth.*` 选 provider、`BLACKBOX_API_KEY/BASE_URL/MODEL`、设备码 OAuth 常量
+（服务已下线）等，见 [`docs/BLACKBOX-CLI-RE.md`](docs/BLACKBOX-CLI-RE.md)。
+把它接到本网关只要一条命令（会造隔离 `HOME` 并可顺手跑一次，验证工具调用）：
+
+```powershell
+python -m blackbox_reg cli-env `
+  --gateway-url http://127.0.0.1:8787/p/blackbox/v1 `
+  --gateway-key sk-dcg-… --run
+```
+
+### 测试
+
+| 用例 | 结果 |
+| --- | --- |
+| `python -m unittest discover -s tools/blackbox-reg/tests`（Auth.js 协议 / Key 探测 / TOTP，MockTransport） | 12/12 |
+| `node --test tests/blackbox-provider.test.mjs`（描述符 / 号池隔离 / 运行时挂载） | 6/6 |
+| `node tests/blackbox-e2e.mjs`（mock 站点 → worker → 号池 → 反代，含 SSE 与 tool_calls） | 8/8 |
+
+一键：`npm run test:blackbox`。
+
+---
+
 ## 4. OpenWebUI 二次开发（fork）
 
 `vendor/open-webui` = **Open WebUI 0.13.4 上游 + DeepAI provider**。
@@ -618,13 +848,22 @@ tools/deepai-reg/ 批量注册机（协议引擎 + Camoufox，产物灌进 accou
 tools/allmodels-reg/ Allmodels 注册机（Better Auth + Turnstile，产物灌进号池文件）
 tools/poe-reg/     Poe 注册机（页内 GraphQL + Camoufox，独立 cookie 号池）
 tools/moonai-reg/  MoonAI 注册机（表单 + 邮箱验证 + OAuth，协议/指纹浏览器双引擎）
+tools/cleverai-reg/ Clever AI Hub 注册机（Firebase + App Check，协议/指纹浏览器双引擎）
+tools/blackbox-reg/ Blackbox AI 注册机（Google OAuth：会话/授权码协议腿 + 指纹浏览器腿）
 src/providers.mjs        provider 运行时装配（每个 provider 一份池 + 控制器）
 src/provider-admin.mjs   `/api/admin/providers/*` 管理面
 src/moonai-adapter.mjs   MoonAI 上游形状 ⇄ OpenAI 形状（剥字段 / 工具模拟 / SSE 合成）
 src/moonai-cli.mjs       MoonAI 命令行（register / pool / export / import / probe / config）
+src/cleverai-pool.mjs    Clever AI 号池：落盘格式、去重、钱包、冷却、导出、网关 Key 绑定
+src/cleverai-register.mjs 批量注册控制器（起 python worker、流式事件、入池）
+src/cleverai-relay.mjs   omni 信封 + SSE ⇄ OpenAI（含 tools / tool_calls 双向翻译、App Check 续期）
+src/cleverai-cli.mjs     Clever AI 命令行（register / pool / export / import / keys / chat）
 deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
 docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
 docs/MOONAI-POOL.md     MoonAI 号池协议 + 注册取证表 + 反代行为
+docs/CLEVERAI-POOL.md   Clever AI 号池协议 + App Check 取证 + 反代/工具翻译
+docs/BLACKBOX-POOL.md   Blackbox 号池协议 + Auth.js/Google OAuth 取证 + 防封与反代
+docs/BLACKBOX-CLI-RE.md Blackbox CLI 逆向记录 + 运行环境模拟（指向本网关）
 docs/ALLMODELS-MCP.md  编程工具接入（MCP / HTTP 工具桥 / 各家配置片段）
 .mcp.json              项目级 MCP 配置（Claude Code 直接发现）
 docker-compose.yml  overlay 镜像（官方 v0.13.4 + 我们的后端/前端文件）
@@ -652,6 +891,11 @@ node tests\moonai-e2e.mjs                   10/10  mock 上游 → 反代：流�
 node tests\moonai-admin.test.mjs            11/11  provider 管理面 + 既有路由不冲突
 node tests\moonai-worker-e2e.mjs            11/11    注册机 → 网关入池 → 反代出 Key（流式+非流式）
 python -m unittest discover -s tools\moonai-reg\tests   6/6  MoonAI 注册协议（本地 mock）
+node --test tests\cleverai-pool.test.mjs    14/14  Clever AI 号池协议 + omni↔OpenAI 工具翻译 + SSE 工具帧
+python -m pytest tools\cleverai-reg\tests -q   20/20 Clever AI 注册协议 + App Check（MockTransport）
+python -m unittest discover -s tools\blackbox-reg\tests   12/12 Blackbox Auth.js 协议 + Key 探测 + TOTP
+node --test tests\blackbox-provider.test.mjs  6/6   Blackbox 描述符 / 号池隔离 / 运行时挂载
+node tests\blackbox-e2e.mjs                   8/8   mock 站点 → worker → 号池 → 反代（含 SSE 与 tool_calls）
 ```
 
 真实上游已验证：`/v1/chat/completions`（流式+非流式）、`/v1/messages`（返回标准
@@ -686,3 +930,46 @@ Anthropic message，含 `thinking` block）、`/v1/search`、`/v1/models`（28 �
 
 
 
+
+---
+
+## 10. Novita 线（`novita-reg` + `provider-*`）
+
+Novita AI 和 WaveSpeed / MoonAI 并列，走同一套 provider 骨架，但它是**唯一能用协议腿
+从零建号**的一条（邮箱密码注册 + 面板自带建 Key 接口），细节见
+[`docs/NOVITA-POOL.md`](docs/NOVITA-POOL.md)。
+
+| 环节 | 落点 |
+| --- | --- |
+| 注册 worker（协议 + 指纹浏览器双腿、域名邮箱、防封） | `tools/novita-reg/` |
+| 号池（独立 schema `dcg.pool/novita@1`） | `data/novita-pool.json` |
+| 注册控制器 / 号池 / 反代 | `src/provider-register.mjs` · `provider-pool.mjs` · `provider-relay.mjs` |
+| 管理接口 | `/api/admin/providers/novita/*`（`src/provider-admin.mjs`） |
+| OpenAI / Anthropic 反代面 | `/p/novita/v1/*` |
+| 编程工具（MCP） | `.mcp.json` 的 `providers` → `node src/provider-mcp.mjs`（12 个 `provider_*` 工具） |
+| 官方沙箱 CLI 逆向 + 离线模拟环境 | [`docs/NOVITA-SANDBOX-RE.md`](docs/NOVITA-SANDBOX-RE.md) · `tools/novita-reg/sandbox-sim.mjs` |
+
+```powershell
+python -m pip install -r tools\novita-reg\requirements.txt
+cd tools\novita-reg
+python -m novita_reg doctor                     # 端点 / sitekey / 邮箱 / 浏览器 / 打码
+
+python -m novita_reg run -n 5 -c 2 --engine auto `
+  --mail-provider domain --mail-domain example.com `
+  --captcha capsolver --captcha-key $env:NOVITA_CAPTCHA_KEY --json
+
+# 接进 Cursor / Claude Code：先拿一把网关 Key
+curl -X POST http://127.0.0.1:8787/api/admin/providers/novita/register `
+  -H "Authorization: Bearer <网关口令>" -H "Content-Type: application/json" `
+  -d '{"count":3,"engine":"auto","mailProvider":"domain","mailDomains":["example.com"],"captcha":"capsolver"}'
+```
+
+三个容易踩的整合点（都有测试锁住）：
+
+1. 网关用 `--out-dir` 和 `--engine hybrid` 调 worker —— CLI 少一个就 argparse 退出，
+   注册全失败。
+2. 防封策略网关用 camelCase 下发（`mailDomains` / `domainRpm` / `ipConcurrency` …），
+   worker 是 snake_case。别名表缺失时策略会**静默失效**。
+3. 反代 `apiBase` 已含 `/openai`，不能再叠一层；`maskedKey` 不能当明文写进号池。
+
+`npm run test:novita` 会跑号池隔离 + 协议离线用例（8 + 15 条）。

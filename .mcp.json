@@ -2,7 +2,25 @@
   "mcpServers": {
     "allmodels": {
       "command": "node",
-      "args": ["src/allmodels-mcp.mjs"],
+      "args": [
+        "src/allmodels-mcp.mjs"
+      ],
+      "env": {}
+    },
+    "providers": {
+      "command": "node",
+      "args": [
+        "src/provider-mcp.mjs"
+      ],
+      "env": {}
+    },
+    "blackbox": {
+      "command": "node",
+      "args": [
+        "src/provider-mcp.mjs",
+        "--provider",
+        "blackbox"
+      ],
       "env": {}
     }
   }

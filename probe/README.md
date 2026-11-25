@@ -17,3 +17,15 @@
 node probe\agents2.mjs     # 需要先 npm install（undici）
 node probe\debug.mjs
 ```
+## cleverai（Clever AI Hub 协议取证）
+
+`probe/cleverai/` 是还原 `cleverai.app` 注册链路的验证用例，结论已固化进
+`tools/cleverai-reg`：
+
+| 文件 | 用途 |
+| --- | --- |
+| `appcheck_probe*.py` | 找 App Check 令牌的取法：`about:blank` 上 reCAPTCHA 不可用，必须站内源；最终用 `page.on("response")` 读 SPA 自己换的那枚 |
+| `chain_probe*.py` | 注册 → 建号 → 聊天的完整链路（含代理差异：浏览器走系统代理、httpx 必须显式 `proxy=`） |
+| `engines_probe.py` | `/configs?type=engines` 列出 94 个 engine（id/type/cost） |
+| `version_probe.py` | 证明缺 `Version/X-Version` 时后端回 "please update the app" 假回答 |
+| `spa_shape_probe.py` / `headers_probe.py` | 还原 `omni/response` 的请求体与请求头 |

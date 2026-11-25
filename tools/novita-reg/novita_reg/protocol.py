@@ -99,10 +99,10 @@ def _panel_error(response: httpx.Response) -> tuple[str, str]:
         return "", (response.text or "")[:300]
     if isinstance(payload, dict):
         code = str(
-            payload.get("errorNo")
-            or payload.get("code")
-            or payload.get("reason")
+            payload.get("reason")
+            or payload.get("errorNo")
             or payload.get("error")
+            or payload.get("code")
             or ""
         )
         message = str(
@@ -135,7 +135,12 @@ def _raise_for(path: str, response: httpx.Response) -> None:
         raise RateLimited(f"{path}: account locked ({message or code})", detail=detail)
     if any(k.lower() in lowered for k in _EMAIL_TAKEN) or "already" in lowered or "exist" in lowered:
         raise EmailTaken(f"{path}: address already registered", detail=detail)
-    if any(k.lower() in lowered for k in _EMAIL_BAD) or "invalid email" in lowered:
+    if (
+        any(k.lower() in lowered for k in _EMAIL_BAD)
+        or "invalid email" in lowered
+        or "use your own email" in lowered
+        or "disposable" in lowered
+    ):
         raise EmailRejected(f"{path}: address rejected ({message or code})", detail=detail)
     if any(k.lower() in lowered for k in _PASSWORD_BAD):
         raise PasswordRejected(f"{path}: password rejected ({message or code})", detail=detail)
@@ -315,6 +320,10 @@ class Novita:
         if not _body_ok(body):
             fake = httpx.Response(400, json=body, request=response.request)
             _raise_for(LOGIN, fake)
+        if isinstance(body, dict) and body.get("token"):
+            # 后续 info / key 接口都靠这个 JWT（cookie 只是浏览器腿的顺带产物）
+            self.token = str(body["token"])
+            self.client.headers["Authorization"] = f"Bearer {self.token}"
         return body if isinstance(body, dict) else {}
 
     def info(self) -> dict[str, Any]:
@@ -387,6 +396,10 @@ class Novita:
         body = response.json() if response.content else {}
         if not _body_ok(body):
             raise KeyNotObtainable(f"建 key 被拒：{str(body)[:300]}")
+        plaintext = _find_plaintext(body)
+        if not plaintext:
+            # 明文只在创建响应里出现一次；拿不到就是拿不到，别假装成功
+            raise KeyNotObtainable(f"建 key 成功但响应里没有明文：{str(body)[:300]}")
         return body if isinstance(body, dict) else {}
 
     def list_keys(self) -> list[dict[str, Any]]:
@@ -652,6 +665,29 @@ class Novita:
         }
 
 
+def _find_plaintext(payload: Any) -> str:
+    """在任意嵌套结构里找 `sk_` 明文（不同版本的键名不统一，值形态是稳定的）。"""
+    if isinstance(payload, str):
+        # 真 key 形如 sk_ + 32~64 位；带 `*` 的是控制台的 maskedKey，不能当明文
+        clean = payload.strip()
+        if clean.startswith("sk_") and "*" not in clean and len(clean) >= 20:
+            return clean
+        return ""
+    if isinstance(payload, dict):
+        for key in ("key", "apiKey", "api_key", "plaintext", "secret", "token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.startswith("sk_"):
+                return value
+        for value in payload.values():
+            found = _find_plaintext(value)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_plaintext(item)
+            if found:
+                return found
+    return ""
 def _normalize_expire(value: Any) -> Any:
     """前端 QP() 的等价物：可读值 → 面板接受的数字（秒）。"""
     if isinstance(value, (int, float)):
@@ -670,9 +706,9 @@ def _token_from_link(link: str) -> str:
     return match.group(1) if match else ""
 
 
-def probe(panel: str = PANEL, *, panel_api: str = PANEL_API, api_base: str = API_BASE, proxy: str = "", timeout: float = 20.0) -> dict[str, Any]:
+def probe(panel: str = PANEL, *, panel_api: str = PANEL_API, api_base: str = API_BASE, proxy: str = "", timeout: float = 20.0, transport: Any = None) -> dict[str, Any]:
     """`doctor` 用：一次便宜的存活检查（不注册、不消耗额度）。"""
-    client = build_client(proxy=proxy, timeout=timeout)
+    client = build_client(proxy=proxy, timeout=timeout, transport=transport)
     try:
         register = safe_request(client, "GET", f"{panel.rstrip('/')}/user/register", retries=1)
         login = safe_request(client, "GET", f"{panel.rstrip('/')}/user/login", retries=1)

@@ -24,6 +24,7 @@ from .errors import (
     VerificationPending,
 )
 from .identity import Persona, make_persona
+from .mail_pool import DomainPool
 from .mailbox import Provider, build_provider
 from .protocol import TURNSTILE_SITE_KEY, TURNSTILE_ACTION, GabSession
 from .store import Store
@@ -58,6 +59,12 @@ class Runner:
         self.browser_factory = browser_factory or (lambda **kw: FingerprintBrowser(**kw))
         self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.cfg.output_dir / "run.log"
+        # Domain scorecard: same SQLite file as the accounts, so nothing extra
+        # to keep in sync with the gateway pool.
+        try:
+            self.domains = DomainPool(self.cfg.db_path)
+        except Exception:  # noqa: BLE001 - a broken scorecard must not stop a run
+            self.domains = None
         self._counter = 0
         self._counter_lock = threading.Lock()
 
@@ -91,6 +98,37 @@ class Runner:
     @staticmethod
     def _sleep(low: float, high: float) -> None:
         time.sleep(random.uniform(low, high))
+
+    def _domains_for(self, provider: Provider) -> list[str]:
+        """Configured domains first, then the provider's, ordered by the scorecard."""
+        configured: list[str] = []
+        if self.cfg.mail.domain:
+            configured.append(self.cfg.mail.domain)
+        for domain in list(self.cfg.mail.domains) + list(provider.domains()):
+            if domain and domain not in configured:
+                configured.append(domain)
+        if self.domains is None:
+            return configured
+        try:
+            return self.domains.candidates(provider.name, configured)
+        except Exception:  # noqa: BLE001
+            return configured
+
+    def _domain_ok(self, provider: str, domain: str) -> None:
+        if self.domains is None or not domain:
+            return
+        try:
+            self.domains.record_ok(provider, domain)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _domain_bad(self, provider: str, domain: str, reason: str) -> None:
+        if self.domains is None or not domain:
+            return
+        try:
+            self.domains.record_bad(provider, domain, reason)
+        except Exception:  # noqa: BLE001
+            pass
 
     def turnstile(self, proxy: str) -> str:
         return self.captcha_solver(
@@ -192,12 +230,7 @@ class Runner:
             provider = self.mail_factory(self.cfg, proxy)
             engine = "protocol"
             try:
-                candidates = list(self.cfg.mail.domains)
-                if self.cfg.mail.domain:
-                    candidates.insert(0, self.cfg.mail.domain)
-                for d in provider.domains():
-                    if d and d not in candidates:
-                        candidates.append(d)
+                candidates = self._domains_for(provider)
                 chosen_domain = candidates[(attempt - 1) % len(candidates)] if candidates else ""
                 box = provider.allocate(persona.local_part, domain=chosen_domain)
                 email_addr = box.address
@@ -263,6 +296,7 @@ class Runner:
 
                 if self.store.add(account, engine=engine, proxy=proxy):
                     self.store.attempt(email_addr, engine, proxy, "created")
+                    self._domain_ok(provider.name, domain)
                     self.emit({"type": "account", "engine": engine, "domain": domain, "provider": provider.name, "account": {
                         "email": email_addr,
                         "password": persona.password,
@@ -287,6 +321,7 @@ class Runner:
             except EmailRejected as exc:
                 last_error = exc
                 self.store.attempt(email_addr, engine, proxy, "email_rejected", str(exc))
+                self._domain_bad(provider.name, domain, str(exc))
             except NoApiKey as exc:
                 last_error = exc
                 self.store.attempt(email_addr, engine, proxy, "no_api_key", str(exc))

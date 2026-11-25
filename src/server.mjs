@@ -17,6 +17,13 @@ import { Registrations } from "./register.mjs";
 import { AllmodelsPool, importAccount, maskAccount } from "./allmodels-pool.mjs";
 import { AllmodelsRegistrations } from "./allmodels-register.mjs";
 import { ToolError, createToolRegistry } from "./allmodels-tools.mjs";
+import {
+  CleveraiPool,
+  importAccount as importCleveraiAccount,
+  maskAccount as maskCleveraiAccount,
+} from "./cleverai-pool.mjs";
+import { CleveraiRegistrations } from "./cleverai-register.mjs";
+import { CleveraiRelay, resolveEngine as resolveCleveraiEngine } from "./cleverai-relay.mjs";
 import { PoePool } from "./poe-pool.mjs";
 import { createProviderRuntime } from "./providers.mjs";
 import { createProviderAdmin } from "./provider-admin.mjs";
@@ -210,6 +217,44 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     log: (level, message) => log(level === "warn" ? "warn" : "info", message),
   });
   const providerAdmin = createProviderAdmin({ runtime: providerRuntime, store, log });
+
+  /**
+   * Clever AI Hub 号池：独立于 DeepAI / Allmodels / provider 运行时。
+   *
+   * 凭据是 Firebase refreshToken（长期）+ App Check JWT（3600s，转发层自动续），
+   * 不是面板 api key。命名空间也独立：`/cleverai/v1/*` 与 `/api/admin/cleverai/*`，
+   * 与其它反代面零重叠（docs/CLEVERAI-POOL.md）。
+   */
+  const cleveraiPool = CleveraiPool.at(config.dataDir, {
+    baseUrl: process.env.CLEVERAI_BASE_URL || "https://cleverai.app",
+    apiBase: process.env.CLEVERAI_API_BASE || "https://api.cleverai.app",
+    engine: process.env.CLEVERAI_CHAT_ENGINE || "openai-gpt-6-luna",
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
+  const cleverai = new CleveraiRegistrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    pool: cleveraiPool,
+    store,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account, gatewayKey }) => {
+      log(
+        "info",
+        `cleverai 入池 ${account.email}（号池 ${cleveraiPool.size}，网关 Key ${gatewayKey?.prefix ?? "-"}）`,
+      );
+    },
+  });
+
+  const cleveraiRelay = new CleveraiRelay({
+    pool: cleveraiPool,
+    store,
+    dataDir: config.dataDir,
+    engine: cleveraiPool.engine,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
 
   const bump = (model) => {
     stats.requests++;
@@ -585,6 +630,115 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     const completion = await result.upstream.json().catch(() => null);
     if (!completion) return sendJson(res, 502, errorBody("Upstream returned an unreadable completion.", "upstream_error"));
     sendJson(res, 200, chatToMessage(completion, { model: resolved.model, requestId }));
+  }
+
+  /* ------------------------------------------------- cleverai 反代出 Key */
+
+  /**
+   * `/cleverai/v1/*`：把号池账号包成 OpenAI 兼容面，给编程工具用。
+   *
+   * 与 `/v1/*`（DeepAI lane）和 `/p/<provider>/v1/*`（provider 运行时）是三条
+   * 完全独立的路：鉴权都用 sk-dcg- Key，但落到不同的上游与不同的号池。
+   * function calling 在 relay 里做了双向翻译，所以 Cline / Continue / Roo
+   * 这类工具可以直接把它当 OpenAI 端点用。
+   */
+  async function handleCleverai(req, res, path, url, auth) {
+    if (path === "/cleverai/v1/models" && req.method === "GET") {
+      const catalog = [
+        { id: "cleverai/default", engine: cleveraiPool.engine },
+        { id: "openai-gpt-6-luna", engine: "openai-gpt-6-luna" },
+        { id: "antropic-calude-sonnet-5-5", engine: "antropic-calude-sonnet-5-5" },
+        { id: "google-gemini-3-8-flash", engine: "google-gemini-3-8-flash" },
+        { id: "xai-grok-4-7", engine: "xai-grok-4-7" },
+      ];
+      return sendJson(res, 200, {
+        object: "list",
+        data: catalog.map((row) => ({
+          id: row.id,
+          object: "model",
+          created: Math.floor(stats.startedAt / 1000),
+          owned_by: "cleverai",
+          engine: row.engine,
+        })),
+      });
+    }
+
+    if ((path === "/cleverai/v1/chat/completions" || path === "/cleverai/v1/completions") && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const model = String(body.model ?? "");
+      const tools = Array.isArray(body.tools) ? body.tools : null;
+      const messages = Array.isArray(body.messages)
+        ? body.messages
+        : typeof body.prompt === "string"
+          ? [{ role: "user", content: body.prompt }]
+          : [];
+      if (!messages.length) {
+        return sendJson(res, 400, errorBody("messages 不能为空。", "invalid_request_error", "bad_request"));
+      }
+      const controller = new AbortController();
+      res.on("close", () => controller.abort());
+      const engine = resolveCleveraiEngine(model || cleveraiPool.engine);
+      bump(`cleverai/${engine}`);
+
+      if (body.stream === true) {
+        stats.streams++;
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-store",
+          "X-Accel-Buffering": "no",
+        });
+        try {
+          for await (const chunk of cleveraiRelay.streamOpenAI({
+            messages,
+            model,
+            tools,
+            signal: controller.signal,
+          })) {
+            if (res.writableEnded) break;
+            if (!res.write(chunk)) {
+              await new Promise((resolve) => {
+                res.once("drain", resolve);
+                res.once("close", resolve);
+              });
+            }
+          }
+        } catch (cause) {
+          if (!controller.signal.aborted) {
+            log("error", `cleverai stream failed: ${cause?.message ?? cause}`);
+            // 头已经发了，只能补一个错误帧再收尾。
+            if (!res.writableEnded) {
+              res.write(
+                `data: ${JSON.stringify({ error: { message: String(cause?.message ?? "upstream error"), type: "upstream_error" } })}\n\n`,
+              );
+            }
+          }
+        }
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
+      try {
+        const completion = await cleveraiRelay.complete({ messages, model, tools, signal: controller.signal });
+        return sendJson(res, 200, completion);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/cleverai/v1/usage" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, pool: cleveraiPool.stats(), relay: cleveraiRelay.status() });
+    }
+
+    return sendJson(
+      res,
+      404,
+      errorBody(`No cleverai route for ${req.method} ${path}.`, "invalid_request_error", "not_found"),
+    );
   }
 
   async function handleSearch(req, res, path) {
@@ -964,6 +1118,146 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     }
 
 
+    /* ------------------------------------------------ cleverai 号池协议 */
+    // 全部挂在 /api/admin/cleverai/* 下，与 allmodels / poe / providers 不重叠。
+    // 协议见 docs/CLEVERAI-POOL.md（`dcg.pool/cleverai@1`）。
+    if (path === "/api/admin/cleverai/status" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...cleverai.status(), relay: cleveraiRelay.status() });
+    }
+
+    if (path === "/api/admin/cleverai/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...cleverai.start(body) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/cleverai/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...cleverai.stop() });
+    }
+
+    if (path === "/api/admin/cleverai/pool" && req.method === "GET") {
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      return sendJson(res, 200, {
+        ok: true,
+        schema: cleveraiPool.toJSON().schema,
+        baseUrl: cleveraiPool.baseUrl,
+        apiBase: cleveraiPool.apiBase,
+        engine: cleveraiPool.engine,
+        updatedAt: cleveraiPool.toJSON().updatedAt,
+        stats: cleveraiPool.stats(),
+        accounts: cleveraiPool.accounts.slice(-limit).map(maskCleveraiAccount),
+      });
+    }
+
+    if (path === "/api/admin/cleverai/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      if (!email || !(body.refreshToken ?? body.refresh_token)) {
+        return sendJson(res, 400, errorBody("需要 email 与 refreshToken。", "invalid_request_error", "bad_request"));
+      }
+      const { account, created, gatewayKey } = importCleveraiAccount({
+        pool: cleveraiPool,
+        store,
+        record: body,
+        mintKey: body.mintKey !== false,
+      });
+      log("info", `cleverai 入池 ${email}（号池 ${cleveraiPool.size}）`);
+      return sendJson(res, created ? 201 : 200, {
+        ok: true,
+        created,
+        account: maskCleveraiAccount(account),
+        gatewayKey: gatewayKey ? { id: gatewayKey.id, label: gatewayKey.label, prefix: gatewayKey.prefix, plaintext: gatewayKey.plaintext } : null,
+        pool: cleveraiPool.stats(),
+      });
+    }
+
+    if (path === "/api/admin/cleverai/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+        ? String(params.get("format"))
+        : "jsonl";
+      let result;
+      try {
+        result = cleverai.export({ format });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (params.get("download") === "1") {
+        const body = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "cleverai-pool.jsonl";
+        res.writeHead(200, {
+          "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json",
+          "Content-Length": String(body.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(body);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    const cleveraiHealth = /^\/api\/admin\/cleverai\/pool\/([^/]+)\/health$/.exec(path);
+    if (cleveraiHealth && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      const updated = cleveraiPool.recordResult(cleveraiHealth[1], {
+        ok: body.ok !== false,
+        error: body.error ?? null,
+        cooldownMs: Number(body.cooldownMs ?? 0),
+      });
+      if (!updated) return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      return sendJson(res, 200, { ok: true, account: maskCleveraiAccount(updated), pool: cleveraiPool.stats() });
+    }
+
+    const cleveraiDelete = /^\/api\/admin\/cleverai\/pool\/([^/]+)$/.exec(path);
+    if (cleveraiDelete && req.method === "DELETE") {
+      if (!cleveraiPool.remove(cleveraiDelete[1])) {
+        return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, { ok: true, pool: cleveraiPool.stats() });
+    }
+
+    if (path === "/api/admin/cleverai/keys" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        keys: cleveraiPool.accounts.map((account) => ({
+          email: account.email,
+          uid: account.uid,
+          engine: account.engine,
+          status: account.status,
+          wallet: account.wallet ?? {},
+          gatewayKey: account.gatewayKey
+            ? { id: account.gatewayKey.id, label: account.gatewayKey.label, prefix: account.gatewayKey.prefix }
+            : null,
+        })),
+      });
+    }
+
+    if (path === "/api/admin/cleverai/appcheck" && req.method === "POST") {
+      try {
+        const token = await cleveraiRelay.vault.get({ force: true });
+        return sendJson(res, 200, { ok: true, token, relay: cleveraiRelay.status() });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
     if (path === "/api/admin/exchange" && req.method === "POST") {
       let body;
       try {
@@ -1188,6 +1482,13 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
           keys: allmodelsPool.accounts.filter((a) => a.gatewayKey).length,
         },
         providers: providerRuntime.stats(),
+        cleverai: {
+          accounts: cleveraiPool.size,
+          healthy: cleveraiPool.healthy().length,
+          keys: cleveraiPool.accounts.filter((a) => a.gatewayKey).length,
+          appCheck: cleveraiRelay.vault.valid(),
+          credits: cleveraiPool.stats().credits,
+        },
         requests: stats.requests,
         streams: stats.streams,
         uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
@@ -1246,6 +1547,12 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     const limited = enforceKeyLimits(auth);
     if (limited) return sendJson(res, limited.status, limited.body, limited.headers);
+
+    // Clever AI Hub 面：/cleverai/v1/*（与 /v1/* 和 /p/* 互不重叠）
+    if (path === "/cleverai" || path.startsWith("/cleverai/")) {
+      return handleCleverai(req, res, path, url, auth);
+    }
+
 
     if (path === "/v1/chat/completions" && req.method === "POST") return handleChatCompletions(req, res, auth);
     if (path === "/v1/completions" && req.method === "POST") return handleLegacyCompletions(req, res, auth);
@@ -1312,7 +1619,7 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       });
   });
 
-  return { server, adminToken, allmodels, allmodelsPool, providers: providerRuntime };
+  return { server, adminToken, allmodels, allmodelsPool, providers: providerRuntime, cleverai, cleveraiPool, cleveraiRelay };
 }
 
 /**

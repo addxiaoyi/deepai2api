@@ -1,7 +1,6 @@
 """防封策略 —— 独立成文件，因为它是"能跑多久"的决定因素。
 
-WaveSpeed 只有 OAuth，所以"注册"实际上等于"用一套自洽的身份去点 OAuth 并领 key"。
-平台侧真正能用来聚类的信号只有这些，本模块逐条给出对策：
+Novita 有完整的邮箱注册表单，可聚类的信号比 WaveSpeed 更多。本模块逐条给出对策：
 
   1. **出口 IP**       → `IpGate`：同一出口 IP 同时只跑 1 个；换 IP 才换身份。
   2. **邮箱域名**       → `DomainRotator`：轮换 + 单域名速率窗 + 健康分降权。
@@ -106,7 +105,8 @@ class DomainRotator:
     def __init__(self, domains: list[str], anti: AntiBanConfig, rng: random.Random | None = None) -> None:
         self.rng = rng or random.Random()
         self.anti = anti
-        self._guard = threading.Lock()
+        # pick() 在持锁期间会调 available()，必须是可重入锁，否则自死锁。
+        self._guard = threading.RLock()
         self.states: dict[str, DomainState] = {}
         for domain in domains:
             clean = (domain or "").strip().lower()
@@ -207,8 +207,8 @@ class SessionEntry:
 class SessionCache:
     """按出口 IP 缓存 cookie jar。
 
-    WaveSpeed 只有 OAuth：每次注册都重新走一遍 Google/GitHub 登录，对提供方
-    来说就是"同一账号反复授权"，这本身会被风控。会话复用的价值在这里。
+    Novita 的 voucher 风控会看"同设备多账号"：复用一份已激活的会话（而不是
+    每次都从头登录）能显著降低"同一 IP 反复出现新账号"的观感。
     """
 
     def __init__(self, ttl_hours: int = 72) -> None:
@@ -354,3 +354,60 @@ def should_rotate_identity(kind: str) -> bool:
         "captcha_required",
         "oauth_unavailable",
     )
+
+
+
+
+# ------------------------------------------------------- Novita 专属：多账号隔离
+
+
+def profile_isolation_plan(
+    email: str,
+    *,
+    root: str = "",
+    isolate: bool = True,
+    clear_storage: bool = True,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """规划一个账号的隔离方案。
+
+    Novita 官方 FAQ 明确：检测到"同设备多账号"会自动撤销 voucher。所以在同一台
+    机器上批量跑时，每个账号必须看起来像一台独立设备：
+
+      * 独立 profile 目录（cookie / cache / IndexedDB 各自一份）
+      * 独立 canvas / WebGL 噪声种子（由 persona.profile_seed 派生）
+      * 进入页面前清 localStorage / sessionStorage
+    """
+    if not isolate or not root:
+        return {
+            "profile_dir": root,
+            "isolated": False,
+            "clear_storage": clear_storage,
+            "noise_seed": seed,
+        }
+    tag = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (email or "anon"))[:48]
+    return {
+        "profile_dir": f"{root.rstrip('/')}/{tag}",
+        "isolated": True,
+        "clear_storage": clear_storage,
+        "noise_seed": seed or (hash(email) & 0x7FFFFFFF),
+    }
+
+
+def key_policy_payload(
+    *,
+    open_model_access: bool = False,
+    model_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """建完 key 后要 PUT 的 model-access 策略体。
+
+    Novita 默认会挡掉一部分模型（`model_access_denied`），把 model-access 打开
+    就能让这把 key 用全量模型。只在 `open_model_access=true` 时发送。
+    """
+    if not open_model_access:
+        return {}
+    payload: dict[str, Any] = {"modelAccess": "all"}
+    if model_ids:
+        payload["modelAccess"] = list(model_ids)
+    return payload
+

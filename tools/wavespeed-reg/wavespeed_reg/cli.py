@@ -302,7 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def shared(p: argparse.ArgumentParser) -> None:
-        p.add_argument("-o", "--out", help="输出目录（默认 out）")
+        # 网关控制器传的是 --out-dir（与其它 provider worker 对齐），本地习惯是 -o/--out
+        p.add_argument("-o", "--out", "--out-dir", dest="out", help="输出目录（默认 out）")
         p.add_argument("--proxy", action="append", help="代理，可重复或逗号分隔")
         p.add_argument("--no-proxy", action="store_true", help="忽略环境代理")
         p.add_argument("--base-url", help="面板地址（默认 https://wavespeed.ai）")

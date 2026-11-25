@@ -16,7 +16,7 @@
 //   apiBase     —— OpenAI 兼容推理地址（反代层用）
 //   consoleBase —— 控制台地址（浏览器腿导航用）
 
-export const PROVIDER_IDS = ["wavespeed", "novita", "moonai"];
+export const PROVIDER_IDS = ["wavespeed", "novita", "moonai", "zo", "blackbox"];
 
 const DEFAULTS = {
   // 面板 / 控制台 / 推理
@@ -220,6 +220,249 @@ const RAW = [
       allowedFields: ["model", "messages", "temperature", "top_p", "max_tokens", "max_completion_tokens"],
     },
   },
+  {
+    // --------------------------------------------------------------------- zo
+    // zo.computer（Zo Computer，云端常驻 Linux + 常驻 agent）。形态和前面几个都不同：
+    //
+    //   1) **无密码**。登录只有 Google SSO 与邮件魔法链（magic link）两条腿：
+    //        POST {panel}/api/email-login/request  {email, redirect, desktop}
+    //        → 邮件里 https://www.zo.computer/email-login/verify?token=…
+    //        → POST {panel}/api/email-login/confirm?token=…（可带 turnstileToken）
+    //        → Set-Cookie: access_token / refresh_token（Domain=.zo.computer）
+    //   2) **注册 = 建工作区**：拿到会话后 POST {api}/signup/ {handle}，
+    //      handle 相当于子域/用户名，且要先 GET {api}/signup/{handle}/available 探占用。
+    //   3) **对外凭据是 access token**（Settings → Advanced 里生成，形如 zo_sk_…），
+    //      不是 OpenAI Key；接口面也只有四个：
+    //        POST {api}/zo/ask                对话（SSE 事件 FrontendModelResponse）
+    //        GET  {api}/models/available      可用模型（含 BYOK）
+    //        GET  {api}/models/catalog        全量目录（公开，无需鉴权）
+    //        GET  {api}/personas/available    persona 列表
+    //        POST {api}/mcp                   MCP over HTTP（tools/list、tools/call）
+    //   4) 所以反代层要做的不是"透传"，而是把 OpenAI / Anthropic 的 chat 形状翻译成
+    //      `{input, model_name, stream}`，并把 MCP 工具暴露给编程工具。翻译在
+    //      src/zo-adapter.mjs，`relay.kind = "zo-ask"` 时由 provider-relay 调用。
+    id: "zo",
+    label: "Zo Computer",
+    panelBase: "https://www.zo.computer",
+    consoleBase: "https://www.zo.computer",
+    apiBase: "https://api.zo.computer",
+    modelsPath: "/models/available",
+    defaultModel: "zo:openai/gpt-6.2-astra",
+    supportsEmailSignup: true,
+    supportsOAuthOnly: false,
+    // access token 由 /api-keys/ 创建，能列也能建（形状见 docs/ZO-POOL.md）
+    supportsKeyListing: true,
+    supportsKeyCreationApi: true,
+    // 上游不是 OpenAI 形状：只有 /zo/ask 一个对话入口，且流式是自有 SSE 事件
+    openAiCompatible: false,
+    signInUrl: "https://www.zo.computer/signup",
+    registerUrl: "https://www.zo.computer/signup",
+    accessKeyUrl: "https://www.zo.computer/settings/advanced",
+    docs: "https://www.zo.computer/reference/api-reference",
+    desktop: {
+      // 桌面端（Electron）把 web 版整个装进壳里，UA 带 `Zo/…`，
+      // 前端用 /Zo\//.test(navigator.userAgent) 判断"是不是桌面端"。
+      userAgentMarker: "Zo/",
+      deepLink: "zo://email-login",
+      deepLinkQuery: ["token", "turnstile"],
+      releases: {
+        mac: "https://github.com/zocomputer/Zo/releases/latest/download/Zo.dmg",
+        windows: "https://github.com/zocomputer/Zo/releases/latest/download/Zo-Setup.exe",
+        linuxDeb: "https://github.com/zocomputer/Zo/releases/latest/download/Zo.deb",
+        linuxDebArm64: "https://github.com/zocomputer/Zo/releases/latest/download/Zo-arm64.deb",
+      },
+    },
+    // ---- 线上实测（2026-11，证据见 docs/ZO-POOL.md 取证表 + tools/zo-reg/_re/）----
+    turnstileSiteKey: "0x4AAAAAADTRT4Uvmz3G7YH5",
+    mcpPath: "/mcp",
+    panelApi: {
+      emailLogin: { method: "POST", path: "/api/email-login/request" },
+      confirm: { method: "POST", path: "/api/email-login/confirm" },
+      verifyPage: { method: "GET", path: "/email-login/verify" },
+      loginState: { method: "GET", path: "/api/login-state" },
+      logout: { method: "POST", path: "/logout" },
+      signupAvailable: { method: "GET", path: "/signup/{handle}/available" },
+      signup: { method: "POST", path: "/signup/" },
+      apiKeys: { method: "GET|POST", path: "/api-keys/" },
+      modelsAvailable: { method: "GET", path: "/models/available" },
+      modelsCatalog: { method: "GET", path: "/models/catalog" },
+      personas: { method: "GET", path: "/personas/available" },
+      ask: { method: "POST", path: "/zo/ask" },
+      mcp: { method: "POST", path: "/mcp" },
+      byok: { method: "GET", path: "/byok/" },
+      settings: { method: "GET", path: "/settings/" },
+    },
+    relay: {
+      kind: "zo-ask",
+      path: "/zo/ask",
+      authMode: "user-token", // Bearer <access token>（zo_sk_…）
+      mcpPath: "/mcp",
+      // 上游返回的是 Zo agent 的整段输出（工具调用已经在 Zo 侧跑完），
+      // 所以只需要把 SSE 事件折成 OpenAI chunk，不需要自己合成"假工具调用"。
+      synthesizeStream: true,
+      emulateTools: true,
+      modelsPath: "/models/available",
+      // /zo/ask 只认这几个字段；多一个都别传（pydantic 校验）
+      allowedFields: ["input", "conversation_id", "model_name", "persona_id", "output_format", "memory_mode", "stream"],
+    },
+  },
+  {
+    // ---------------------------------------------------------------- blackbox
+    // blackbox.ai（BLACKBOX AI，#1 AI Coding Agent）。形态与其它 provider 都不一样：
+    //
+    //   1) **没有邮箱密码注册**。app.blackbox.ai 是 Auth.js(NextAuth v5) + **只有
+    //      Google 一个 provider**（`GET /api/auth/providers` 只回 google，实测
+    //      `POST /api/auth/sign-up/email` 恒 400 "Bad request."）。所以"注册"= 用
+    //      Google 身份走一次 OAuth 授权，落地成 app 侧的 `__Secure-authjs.session-token`。
+    //   2) **域名邮箱的作用**因此是"身份来源"而不是"注册表单字段"：自有域 catch-all
+    //      信箱收 Google 的安全提醒 / 验证码，以及 console 那条 OTP 腿的一次性码。
+    //   3) **Key 在面板里**（app.blackbox.ai/dashboard），格式 `sk-…`，官方文档把
+    //      Agent API 的 Key 也定成 `sk-xxxxxxxx`。面板侧建 Key 的接口路径没在公开
+    //      文档里，worker 用"候选路径探测 + 命中即缓存"（`--keys-path` 可覆盖）。
+    //   4) **推理是标准 OpenAI 形状**，鉴权 `Authorization: Bearer sk-…`，所以反代层
+    //      直接走通用透传（`/p/blackbox/v1/*`），不需要 adapter。
+    //   5) 另有一条 **Email OTP + Turnstile** 的 console 腿（console.blackbox.ai/login），
+    //      但入口写着"公司必须已经在 GPU Console 里开通，或由管理员加你"，
+    //      所以它是可选的第二条腿（`--engine console`），不是默认路径。
+    //
+    // 线上取证（2026-11，见 docs/BLACKBOX-POOL.md 的取证表）：
+    //   GET  https://app.blackbox.ai/api/auth/providers
+    //        -> {"google":{"id":"google","name":"Google","type":"oidc", ...}}
+    //   GET  https://app.blackbox.ai/api/auth/csrf          -> {"csrfToken":"…"}
+    //   POST https://app.blackbox.ai/api/auth/signin/google -> 302 到
+    //        accounts.google.com/o/oauth2/v2/auth?client_id=985058387028-…&
+    //        redirect_uri=https://app.blackbox.ai/api/auth/callback/google&
+    //        code_challenge_method=S256&scope=openid profile email
+    //   GET  https://app.blackbox.ai/api/auth/session        -> null（未登录）
+    //   GET  https://app.blackbox.ai/api/auth/session-challenge
+    //        -> 401 {"status":"unauthenticated"}
+    //   POST https://enterprise.blackbox.ai/chat/completions  -> 403
+    //        {"error":{"message":"blackbox.Error: Invalid API key","type":"auth_error"}}
+    //   POST https://enterprise.blackbox.ai/v1/chat/completions -> 同上（/v1 也可用）
+    //   api.blackbox.ai 目前对一切路径回 404（Google Frontend），只剩历史意义；
+    //   chat.blackboxcli.ai（CLI 的设备码 OAuth）已 NXDOMAIN。
+    id: "blackbox",
+    label: "Blackbox AI",
+    panelBase: "https://app.blackbox.ai",
+    consoleBase: "https://console.blackbox.ai",
+    // src/provider-relay.mjs 拼 `${apiBase}${rest}`，rest 是 /v1/chat/completions
+    apiBase: "https://enterprise.blackbox.ai",
+    // 上游没有 /models（实测 /models 与 /v1/models 都 404）：靠描述符里的白名单，
+    // listModels 拿不到上游数据时会退回这里。
+    modelsPath: "",
+    defaultModel: "blackboxai/blackbox-pro",
+    models: [
+      "blackboxai/blackbox-pro",
+      "blackboxai/blackbox-ai",
+      "blackboxai/blackbox-search",
+      "blackboxai/openai/gpt-4o",
+      "blackboxai/openai/gpt-4o-mini",
+      "blackboxai/anthropic/claude-sonnet-4",
+      "blackboxai/google/gemini-2.5-pro",
+    ],
+    // 注册入口只有 Google OAuth；邮箱密码注册不存在（上面的 400 实测）
+    supportsEmailSignup: false,
+    supportsOAuthOnly: true,
+    // 面板能列也能建 Key，但走的是"登录态"而不是公开 API Key 接口
+    supportsKeyListing: true,
+    supportsKeyCreationApi: true,
+    openAiCompatible: true,
+    signInUrl: "https://app.blackbox.ai/login",
+    registerUrl: "https://app.blackbox.ai/login",
+    accessKeyUrl: "https://app.blackbox.ai/dashboard",
+    docs: "https://docs.blackbox.ai/api-reference/chat",
+
+    // ---- 这个 worker 额外吃的命令行开关（其它 provider 传了也不会被拼进去）
+    workerFlags: [
+      "--session-file",
+      "--google-pool",
+      "--google-cookies",
+      "--keys-path",
+      "--keys-create-path",
+      "--authorization-code",
+      "--console-url",
+    ],
+    // ---- Auth.js（NextAuth v5）授权参数：worker 的协议腿就照这张表走 ----
+    auth: {
+      kind: "authjs",
+      providersPath: "/api/auth/providers",
+      csrfPath: "/api/auth/csrf",
+      signinPath: "/api/auth/signin/google",
+      callbackPath: "/api/auth/callback/google",
+      sessionPath: "/api/auth/session",
+      challengePath: "/api/auth/session-challenge",
+      // Auth.js v5 的 cookie 前缀（HTTPS）
+      cookiePrefix: "__Secure-authjs",
+      sessionCookie: "__Secure-authjs.session-token",
+      callbackCookie: "__Secure-authjs.callback-url",
+      stateCookie: "__Secure-authjs.state",
+      pkceCookie: "__Secure-authjs.pkce.code_verifier",
+      // 从 302 Location 里读出来的（docs/BLACKBOX-POOL.md 取证表）
+      googleClientId: "985058387028-iaa60lr5e586kvhjp085qcojv3jv2p7h.apps.googleusercontent.com",
+      scope: "openid profile email",
+    },
+    // ---- 面板 Key 接口：没有公开文档，按候选路径探测，命中就写进 out/key-endpoints.json
+    panelApi: {
+      session: { method: "GET", path: "/api/auth/session" },
+      challenge: { method: "GET", path: "/api/auth/session-challenge" },
+      userActivity: { method: "POST", path: "/api/user-activity" },
+      // 候选（第一个 200/201 且回带 sk-… 的即为真）
+      keyCandidates: [
+        "/api/keys",
+        "/api/v1/keys",
+        "/api/user/api-keys",
+        "/api/user/keys",
+        "/api/agent-api/keys",
+        "/api/dashboard/keys",
+        "/api/me/keys",
+        "/api/api-keys",
+        "/api/settings/api-keys",
+        "/api/v1/api-keys",
+        "/api/account/api-keys",
+      ],
+    },
+    // ---- console 腿：Email OTP + Cloudflare Turnstile（需要公司已开通 GPU Console）
+    consoleLogin: {
+      path: "/login",
+      turnstile: true,
+      note: "入口要求 work email 且公司已在 BLACKBOX GPU Console 开通；Turnstile 用解题器或浏览器腿过。",
+    },
+    // ---- 反代：OpenAI 形状，透传即可（不需要 adapter）
+    relay: {
+      kind: "openai",
+      path: "/v1/chat/completions",
+      authMode: "api-key",
+      // 上游 /v1/messages 不在路由表里，Anthropic 请求由 relay 翻成 chat 再翻回来
+      synthesizeStream: false,
+      emulateTools: false,
+    },
+    // ---- CLI / 桌面端（用于"下载并逆向 + 模拟运行环境"）
+    cli: {
+      npm: "@blackbox_ai/blackbox-cli",
+      npmCore: "@blackbox_ai/blackbox-cli-core",
+      installPs1: "https://blackbox.ai/install.ps1",
+      installSh: "https://blackbox.ai/install.sh",
+      releasesBase: "https://releases.blackbox.ai",
+      releasesApi: "https://releases.blackbox.ai/api/v0/latest?product=blackbox-cli-v2&platform=windows-x64",
+      // 设备码 OAuth（已下线，留档）：client_id + scope 从包内常量读出来的
+      deviceFlow: {
+        base: "https://chat.blackboxcli.ai",
+        codePath: "/api/v1/oauth2/device/code",
+        tokenPath: "/api/v1/oauth2/token",
+        clientId: "f0304373b74a44d2b584a3fb70ca9e56",
+        scope: "openid profile email model.completion",
+      },
+      env: {
+        apiKey: "BLACKBOX_API_KEY",
+        apiBase: "BLACKBOX_API_BASE_URL",
+        model: "BLACKBOX_API_MODEL",
+        encryptionBase: "BLACKBOX_ENCRYPTION_BASE_URL",
+      },
+      credentialsFile: "~/.blackboxcli/oauth_creds.json",
+      // 把 CLI 指向本网关时的默认模型（CLI 的 --model 会覆盖）
+      gatewayModel: "blackboxai/blackbox-pro",
+    },
+  },
 ];
 
 export const PROVIDERS = Object.freeze(RAW.map(describe));
@@ -277,6 +520,15 @@ export function providerSummary(provider) {
     docs: provider.docs || "",
     // moonai 这类"自有协议"的 provider 需要额外声明，管理台/CLI 直接读这里
     models: Array.isArray(provider.models) ? [...provider.models] : [],
+    // blackbox 这类"登录态 + OAuth"的 provider：把登录入口与 CLI 信息也带出去，
+    // 面板/CLI 不用再硬编码站点细节。
+    auth: provider.auth
+      ? { kind: provider.auth.kind, sessionCookie: provider.auth.sessionCookie, googleClientId: provider.auth.googleClientId }
+      : null,
+    cli: provider.cli
+      ? { npm: provider.cli.npm, installPs1: provider.cli.installPs1, gatewayModel: provider.cli.gatewayModel }
+      : null,
+    consoleLogin: provider.consoleLogin ?? null,
     relay: provider.relay
       ? {
           kind: provider.relay.kind,

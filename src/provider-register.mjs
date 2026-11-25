@@ -423,6 +423,17 @@ export class ProviderRegistrations {
     for (const proxy of proxies) args.push("--proxy", proxy);
     if (options.verifyEmail === false) args.push("--no-verify");
     if (sessionImport) args.push("--session-file", String(sessionImport.file ?? ""));
+    // provider 专属开关：只拼描述符 workerFlags 里声明过的，
+    // 别的 provider 的 worker 不会因为多出来的参数而 argparse 报错。
+    const workerFlags = new Set(Array.isArray(this.provider.workerFlags) ? this.provider.workerFlags : []);
+    const workerArgs = options.workerArgs && typeof options.workerArgs === "object" ? options.workerArgs : {};
+    for (const [flag, value] of Object.entries(workerArgs)) {
+      if (!workerFlags.has(flag)) continue;
+      const text = String(value ?? "").trim();
+      if (!text) continue;
+      if (flag === "--session-file" && sessionImport) continue; // 上面已经拼过
+      args.push(flag, text);
+    }
 
     this.job = {
       id: `${this.id}-reg-${Date.now().toString(36)}`,

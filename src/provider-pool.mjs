@@ -446,6 +446,10 @@ export function normalizeAccount(raw = {}) {
     refreshToken: String(raw.refreshToken ?? raw.refresh_token ?? ""),
     accessTokenExpiresAt: Number(raw.accessTokenExpiresAt ?? raw.access_token_expires_at ?? 0) || 0,
     emailVerified: raw.emailVerified ?? raw.email_verified ?? null,
+    // blackbox 这类"登录态 + 套餐"的 provider：把套餐与外部用户 id 也带进号池，
+    // 面板能直接显示"这号是 free 还是 pro"，排障时不用再去站点后台看。
+    plan: String(raw.plan ?? ""),
+    userId: String(raw.userId ?? raw.user_id ?? ""),
     status: raw.status ?? "active",
     engine: raw.engine ?? "protocol",
     domain: String(raw.domain ?? ""),

@@ -1,147 +1,121 @@
-"""身份生成：姓名、邮箱 local part、密码、以及"与出口地理对齐"的指纹种子。
+"""Personas: 每个注册单元一套自洽的身份。
 
-一个 persona 就是一次注册的全部自变量。同一个 persona 的 seed 会同时决定
-UA / 时区 / 语言 / 屏幕，所以浏览器腿和协议腿看到的是**同一台机器**。
+比 `allmodels_reg.identity` 多了两件事：
+
+  * `timezone` / `locale` / `accept_language` —— 必须与代理出口的地理位置一致，
+    否则 Cloudflare 与 OAuth 提供方都会给可疑分。`geo_for_proxy()` 按代理出口
+    国家给出对应组合。
+  * `profile_seed` —— 浏览器指纹的确定性种子，同一个 persona 重跑得到同一套
+    canvas/WebGL 噪声，方便复现问题。
 """
 
 from __future__ import annotations
 
-import hashlib
 import random
 import string
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 
 FIRST = (
-    "ada", "alan", "amir", "ana", "aria", "axel", "bea", "ben", "cara", "chen",
-    "dana", "dario", "eden", "eli", "emma", "erin", "finn", "gala", "hana", "hugo",
-    "ines", "ivan", "jade", "jonas", "kaya", "kira", "leo", "lina", "maya", "milo",
-    "nina", "noah", "olga", "omar", "pia", "quinn", "ravi", "rosa", "sami", "sara",
-    "tara", "theo", "uma", "vera", "wade", "xena", "yuki", "zane", "zoe", "noor",
+    "ada", "noor", "kai", "lena", "milo", "iris", "theo", "zara", "omar", "ruth",
+    "ivan", "maya", "hugo", "elsa", "finn", "amara", "yuki", "dario", "nina", "sami",
+    "leo", "anya", "ravi", "elin", "tomas", "sara", "jonas", "mei", "adam", "vera",
 )
 LAST = (
-    "adams", "baker", "bloom", "carter", "diaz", "ellis", "fischer", "gomez",
-    "hansen", "ibrahim", "jones", "keller", "lopez", "meyer", "novak", "okafor",
-    "petrov", "quinn", "rossi", "silva", "tanaka", "ulrich", "vance", "weber",
-    "xu", "yamada", "zhang", "kowalski", "lovelace", "moreau", "salim", "takeda",
+    "lovelace", "haddad", "okafor", "marsh", "vance", "keller", "nasser", "bloom",
+    "petrov", "salim", "oka", "reyes", "holm", "abbas", "quinn", "silva",
+    "moreau", "tanaka", "schulz", "ivanov", "costa", "berg", "lindqvist", "patel",
 )
+SYMBOLS = "!@#$%&*?"
 
-# 出口 → (时区, 语言, Accept-Language)。geo_align 打开时用它覆盖 persona 默认值。
+# 代理出口国家 → (timezone, locale, accept-language)
 GEO = {
     "us": ("America/New_York", "en-US", "en-US,en;q=0.9"),
     "ca": ("America/Toronto", "en-CA", "en-CA,en;q=0.9"),
     "gb": ("Europe/London", "en-GB", "en-GB,en;q=0.9"),
     "de": ("Europe/Berlin", "de-DE", "de-DE,de;q=0.9,en;q=0.6"),
-    "nl": ("Europe/Amsterdam", "nl-NL", "nl-NL,nl;q=0.9,en;q=0.6"),
     "fr": ("Europe/Paris", "fr-FR", "fr-FR,fr;q=0.9,en;q=0.6"),
+    "nl": ("Europe/Amsterdam", "nl-NL", "nl-NL,nl;q=0.9,en;q=0.6"),
     "sg": ("Asia/Singapore", "en-SG", "en-SG,en;q=0.9"),
-    "jp": ("Asia/Tokyo", "ja-JP", "ja-JP,ja;q=0.9,en;q=0.6"),
+    "jp": ("Asia/Tokyo", "ja-JP", "ja-JP,ja;q=0.9,en;q=0.5"),
     "hk": ("Asia/Hong_Kong", "zh-HK", "zh-HK,zh;q=0.9,en;q=0.6"),
+    "tw": ("Asia/Taipei", "zh-TW", "zh-TW,zh;q=0.9,en;q=0.6"),
+    "kr": ("Asia/Seoul", "ko-KR", "ko-KR,ko;q=0.9,en;q=0.5"),
     "au": ("Australia/Sydney", "en-AU", "en-AU,en;q=0.9"),
-    "br": ("America/Sao_Paulo", "pt-BR", "pt-BR,pt;q=0.9,en;q=0.6"),
+    "br": ("America/Sao_Paulo", "pt-BR", "pt-BR,pt;q=0.9,en;q=0.5"),
     "in": ("Asia/Kolkata", "en-IN", "en-IN,en;q=0.9"),
-    "": ("America/New_York", "en-US", "en-US,en;q=0.9"),
 }
-
-# 免费代理 / 常见机房出口的粗判：没有地理信息时退回美国。
-_GEO_HINTS = (
-    ("jp", ("japan", "tokyo", ".jp")),
-    ("sg", ("singapore", ".sg")),
-    ("de", ("germany", "frankfurt", ".de")),
-    ("gb", ("london", "united kingdom", ".uk")),
-    ("hk", ("hong kong", "hongkong", ".hk")),
-)
-
-
-def geo_for_proxy(proxy: str) -> tuple[str, str, str]:
-    """从代理字符串里猜地理。猜不到就退回 en-US —— 宁可不改，也不要错配。"""
-    lowered = (proxy or "").lower()
-    for code, hints in _GEO_HINTS:
-        if any(hint in lowered for hint in hints):
-            return GEO[code]
-    return GEO[""]
-
-
-def _syllables(rng: random.Random, count: int) -> str:
-    cons = "bcdfghjklmnprstvwz"
-    vow = "aeiou"
-    out = []
-    for _ in range(count):
-        out.append(rng.choice(cons) + rng.choice(vow))
-    return "".join(out)
+DEFAULT_GEO = GEO["us"]
 
 
 @dataclass(slots=True)
 class Persona:
-    email: str = ""
-    local: str = ""
-    password: str = ""
-    first: str = ""
-    last: str = ""
-    profile_seed: int = 0
+    first: str
+    last: str
+    local_part: str
+    name: str
+    password: str
     timezone: str = "America/New_York"
     locale: str = "en-US"
     accept_language: str = "en-US,en;q=0.9"
-    domain: str = ""
-    extra: dict = field(default_factory=dict)
+    profile_seed: int = 0
 
-    @property
-    def display(self) -> str:
-        name = f"{self.first} {self.last}".strip()
-        return name or self.local
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
-def make_password(rng: random.Random) -> str:
-    """满足 Novita 的强度条：大小写 + 数字 + 符号，长度 14。"""
-    upper = rng.choice(string.ascii_uppercase)
-    lower = "".join(rng.choice(string.ascii_lowercase) for _ in range(6))
-    digits = "".join(rng.choice(string.digits) for _ in range(4))
-    symbol = rng.choice("!@#$%^&*")
-    tail = rng.choice(string.ascii_lowercase)
-    chars = list(upper + lower + digits + symbol + tail)
-    rng.shuffle(chars)
-    return "".join(chars)
+def geo_for_proxy(proxy: str) -> tuple[str, str, str]:
+    """从代理字符串里猜出口国家（`...-us-...`、`us.example.com`、`country-us`）。
+
+    猜不出来就用美东 —— 它是 WaveSpeed 用户里最不显眼的一组。
+    """
+    lowered = (proxy or "").lower()
+    if not lowered:
+        return DEFAULT_GEO
+    # 先看有没有显式的国家段：-us- / _us_ / .us. / country=us / geo-us
+    for code in GEO:
+        for pattern in (f"-{code}-", f"_{code}_", f".{code}.", f"country-{code}", f"geo-{code}", f"region-{code}"):
+            if pattern in lowered:
+                return GEO[code]
+    # 再看 TLD 风格：proxy.example.co.uk:8080
+    for code in GEO:
+        if f".{code}:" in lowered or lowered.endswith(f".{code}"):
+            return GEO[code]
+    return DEFAULT_GEO
 
 
 def make_persona(
-    *,
-    domain: str = "",
-    email: str = "",
-    proxy: str = "",
     rng: random.Random | None = None,
+    *,
+    proxy: str = "",
     geo_align: bool = True,
-    local_prefix: str = "",
+    locale_override: str = "",
 ) -> Persona:
     rng = rng or random.Random()
     first = rng.choice(FIRST)
     last = rng.choice(LAST)
-    if email:
-        local = email.split("@")[0]
-        domain = email.split("@")[-1] if "@" in email else domain
-        full = email
+    digits = "".join(rng.choices(string.digits, k=rng.randint(2, 4)))
+    local = f"{first}.{last}{digits}"
+    password = (
+        rng.choice(string.ascii_uppercase)
+        + "".join(rng.choices(string.ascii_lowercase, k=10))
+        + "".join(rng.choices(string.digits, k=4))
+        + rng.choice(SYMBOLS)
+    )
+    if geo_align:
+        tz, locale, accept = geo_for_proxy(proxy)
     else:
-        # 两种 local 形态混着来：first.last 与 first+随机后缀，避免一眼可聚簇。
-        style = rng.random()
-        if style < 0.45:
-            local = f"{first}.{last}"
-        elif style < 0.8:
-            local = f"{first}.{last}{rng.randint(1, 9999)}"
-        else:
-            local = f"{_syllables(rng, 2)}{rng.randint(10, 99)}"
-        if local_prefix:
-            local = f"{local_prefix}{local}"
-        full = f"{local}@{domain}" if domain else local
-
-    tz, locale, accept = geo_for_proxy(proxy) if geo_align else GEO[""]
-    seed = int(hashlib.sha256(full.encode("utf-8")).hexdigest()[:8], 16)
+        tz, locale, accept = DEFAULT_GEO
+    if locale_override:
+        locale = locale_override
+        accept = f"{locale_override},{locale_override.split('-')[0]};q=0.9,en;q=0.5"
     return Persona(
-        email=full,
-        local=local,
-        password=make_password(random.Random(seed ^ 0x5F5F)),
         first=first,
         last=last,
-        profile_seed=seed,
+        local_part=local,
+        name=f"{first.capitalize()} {last.capitalize()}",
+        password=password,
         timezone=tz,
         locale=locale,
         accept_language=accept,
-        domain=domain,
+        profile_seed=rng.randint(1, 2**31 - 1),
     )

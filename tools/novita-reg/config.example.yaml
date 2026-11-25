@@ -1,0 +1,91 @@
+# Novita 注册 worker 的配置示例：`cp config.example.yaml config.yaml`。
+#
+# 优先级：命令行参数 > 环境变量（NOVITA_*）> 本文件 > 内置默认值。
+# 与网关一起用时不需要本文件 —— src/provider-register.mjs 会把所有参数都传成命令行。
+
+panel: https://novita.ai
+panel_api: https://api-server.novita.ai
+api_base: https://api.novita.ai
+openai_base: https://api.novita.ai/openai
+
+engine: auto            # auto | protocol | browser | hybrid
+count: 1
+concurrency: 2
+attempts: 3
+retry_rounds: 1
+delay: [4.0, 9.0]
+timeout: 45
+verify_email: true
+output_dir: out
+
+# ---- 邮箱：域名 catch-all（推荐）----
+# 注册地址是 <随机 local>@<domain>，收信走 IMAP；不需要给每个地址建信箱。
+mail:
+  provider: domain
+  domain: example.com
+  domains:
+    - example.com
+  imap_host: imap.example.com
+  imap_port: 993
+  imap_user: inbox@example.com
+  imap_password: ""          # 建议用 NOVITA_IMAP_PASSWORD 环境变量
+  verify_timeout: 180
+  poll: 4
+
+# ---- Turnstile：注册与登录都强制 ----
+# 没 token 时线上直接 500 CLOUDFLARE_CHECK_ERROR（详见 docs/NOVITA-POOL.md）。
+captcha:
+  provider: capsolver        # none | manual | capsolver | 2captcha | browser | auto
+  api_key: ""                # 建议用 NOVITA_CAPTCHA_KEY 环境变量
+  timeout: 150
+  poll: 4
+
+# ---- 指纹浏览器（浏览器腿）----
+browser:
+  stack: auto                # auto | camoufox | patchright | playwright
+  headless: true
+  cdp: ""                    # 接管 AdsPower / BitBrowser：http://127.0.0.1:50325
+  humanize: 1.0
+  geoip: true
+  turnstile_timeout: 60
+  screenshots: true
+
+# ---- 防封策略：网关用 camelCase 传同名项，两边语义一致 ----
+anti_ban:
+  mail_domains: [example.com]
+  domain_rpm: 3              # 单域名每分钟最多几个账号
+  domain_rph: 40             # 单域名每小时上限
+  domain_health_floor: 0.25
+  ip_concurrency: 1          # 同一出口同时只跑 1 个
+  proxy_rotate: true
+  jitter_ms: [1200, 4200]
+  batch_pause: [0, 0]
+  geo_align: true            # 时区/语言跟随出口
+  fresh_profile: true
+  reuse_session: true
+  session_ttl_hours: 72
+  backoff:
+    rate_limited: [20, 45]
+    blocked: [20, 40]
+    captcha_required: [15, 30]
+    verification_pending: [5, 10]
+    email_taken: [0, 0]
+    email_rejected: [0, 0]
+
+# ---- 每账号建几把面板 Key、叫什么 ----
+key_policy:
+  per_account: 1
+  expire_time: permanent     # permanent | 24h | 30d | 90d | <秒>
+  open_model_access: false
+
+# ---- 代理池：按账号轮换；空数组 = 直连 ----
+proxies: []
+#  - http://user:pass@1.2.3.4:8080
+
+# ---- 入池（网关侧）----
+push_url: ""                 # 例如 http://127.0.0.1:8787
+push_token: ""               # 网关管理口令；建议用 NOVITA_GATEWAY_TOKEN
+
+# 代理来源：只认上面的 proxies / NOVITA_PROXY；机器上的 HTTPS_PROXY 默认**不**采用
+# （它会把注册流量静默带走，doctor 还会误报站点不可达）。确实要用就显式开：
+#   $env:NOVITA_USE_ENV_PROXY = "1"

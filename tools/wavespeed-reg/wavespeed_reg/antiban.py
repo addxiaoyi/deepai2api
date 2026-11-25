@@ -106,7 +106,8 @@ class DomainRotator:
     def __init__(self, domains: list[str], anti: AntiBanConfig, rng: random.Random | None = None) -> None:
         self.rng = rng or random.Random()
         self.anti = anti
-        self._guard = threading.Lock()
+        # pick() 在持锁期间会调 available()，必须是可重入锁，否则自死锁。
+        self._guard = threading.RLock()
         self.states: dict[str, DomainState] = {}
         for domain in domains:
             clean = (domain or "").strip().lower()
@@ -354,3 +355,4 @@ def should_rotate_identity(kind: str) -> bool:
         "captcha_required",
         "oauth_unavailable",
     )
+

@@ -79,10 +79,15 @@ try {
 
   {
     const res = await call("/api/admin/providers", { token: adminToken });
-    check("管理口令可以看到 3 个 provider，moonai 在其中", () => {
+    check("管理口令可以看到 provider 列表，moonai 在其中", () => {
       assert.equal(res.status, 200);
       const ids = res.json.providers.map((p) => p.id);
-      assert.deepEqual(ids.sort(), ["moonai", "novita", "wavespeed"]);
+      // 目录会持续增长（zo / blackbox …），这里只要求早期三条都在，
+      // 避免每加一个 provider 就把这条断言改一次。
+      for (const id of ["moonai", "novita", "wavespeed"]) {
+        assert.ok(ids.includes(id), `${id} 不在 provider 列表里：${ids.join(",")}`);
+      }
+      assert.equal(new Set(ids).size, ids.length, "provider id 必须唯一");
       const moonai = res.json.providers.find((p) => p.id === "moonai");
       assert.equal(moonai.relay.kind, "moonai-llm-proxy");
       assert.equal(moonai.models.length, 6);

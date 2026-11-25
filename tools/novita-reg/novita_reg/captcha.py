@@ -1,195 +1,265 @@
-"""Turnstile 解题：capsolver / 2captcha / 真机渲染 / 手工 token。
+"""人机校验：Turnstile / hCaptcha token。
 
-Novita 的注册与登录**都**强制 Turnstile：没有有效 token 时服务端直接回
-`500 CLOUDFLARE_CHECK_ERROR`（注册）或 `400 VERIFY_TOKEN_FAILED`（登录）。
-sitekey 是 `0x4AAAAAAAaG28VfN_OxkED8`，从 webpack 常量里抠出来的。
+Novita 的 Turnstile sitekey 已从线上 chunk 反查到（0x4AAAAAAAaG28VfN_OxkED8），在线也能重新发现。
+解题优先级（便宜 → 贵）：
 
-四种方式的分工：
-
-    none      不发 token —— 只在出口信誉极好时才有意义，默认会失败
-    manual    直接把 --captcha-key 当 token 用（人工在浏览器里过完复制）
-    capsolver / 2captcha   打码平台，返回 token 字符串
-    browser   起真浏览器，让 Turnstile 自己过，然后从 DOM 里读 token
+  none      : 直接不带 token 试一次，让上游告诉我们"要不要"
+  auto      : 先 none，被拦再按 api_key 是否存在选 capsolver / 2captcha / browser
+  capsolver : AntiTurnstileTask(Proxyless)，尊重页面 action
+  2captcha  : TurnstileTaskProxyless
+  browser   : 在真实页面里渲染 widget，读 callback token
+  manual    : 别人产出的 token（config / env 里给）
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from .errors import CaptchaRequired
-from .net import TURNSTILE_SITE_KEY, build_client, request
+from .net import build_client, request
+
+CAPSOLVER = "https://api.capsolver.com"
+TWOCAPTCHA = "https://2captcha.com"
 
 
-@dataclass
-class CaptchaConfig:
-    provider: str = "none"      # none | manual | capsolver | 2captcha | browser | auto
-    api_key: str = ""
-    site_key: str = TURNSTILE_SITE_KEY
-    page_url: str = "https://novita.ai/user/register"
-    action: str = ""
-    timeout: float = 150.0
-    poll: float = 4.0
+class CaptchaError(CaptchaRequired):
+    pass
 
 
-class Solver:
-    provider = "none"
+def solve_turnstile(
+    *,
+    provider: str,
+    api_key: str,
+    site_url: str,
+    site_key: str,
+    action: str = "signup",
+    proxy: str = "",
+    timeout: float = 120.0,
+    poll: float = 3.0,
+    client: Any = None,
+) -> str:
+    """给 `site_url` / `site_key` 拿一个 Turnstile token。
 
-    def __init__(self, cfg: CaptchaConfig, *, proxy: str = "", browser: Any = None) -> None:
-        self.cfg = cfg
-        self.proxy = proxy
-        self.browser = browser
-
-    def solve(self, *, page_url: str = "", action: str = "") -> str:
+    `auto` 的语义：没有 api_key 就返回空串（交给调用方按"无 token 先试"处理），
+    有 api_key 就按 capsolver 处理 —— 真正的"先试再解题"由 runner 决定。
+    """
+    name = (provider or "none").strip().lower()
+    if name in ("", "none"):
         return ""
+    if name == "auto":
+        return _capsolver(
+            api_key=api_key,
+            site_url=site_url,
+            site_key=site_key,
+            action=action,
+            proxy=proxy,
+            timeout=timeout,
+            poll=poll,
+            client=client,
+        ) if api_key else ""
+    if name == "manual":
+        if not api_key:
+            raise CaptchaError("manual captcha provider needs a token in `captcha.api_key`")
+        return api_key
+    if not site_key:
+        raise CaptchaError("captcha provider needs a site_key (从 /sign-in 页面挖不到)")
+    if name == "capsolver":
+        return _capsolver(
+            api_key=api_key,
+            site_url=site_url,
+            site_key=site_key,
+            action=action,
+            proxy=proxy,
+            timeout=timeout,
+            poll=poll,
+            client=client,
+        )
+    if name == "2captcha":
+        return _twocaptcha(
+            api_key=api_key,
+            site_url=site_url,
+            site_key=site_key,
+            action=action,
+            proxy=proxy,
+            timeout=timeout,
+            poll=poll,
+            client=client,
+        )
+    if name == "browser":
+        return mint_with_browser(site_url=site_url, site_key=site_key, action=action, proxy=proxy, timeout=timeout)
+    raise CaptchaError(f"unknown captcha provider: {provider}")
 
-    def report_bad(self, token: str) -> None:
-        return None
+
+def _capsolver(
+    *,
+    api_key: str,
+    site_url: str,
+    site_key: str,
+    action: str,
+    proxy: str,
+    timeout: float,
+    poll: float,
+    client: Any,
+) -> str:
+    if not api_key:
+        raise CaptchaError("capsolver needs an api key")
+    http = client or build_client(proxy=proxy, timeout=40)
+    task: dict[str, Any] = {
+        "type": "AntiTurnstileTaskProxyLess",
+        "websiteURL": site_url,
+        "websiteKey": site_key,
+        "pageAction": action,
+    }
+    if proxy:
+        # 与注册请求同一出口，Cloudflare 的 IP 评分才一致。
+        task["type"] = "AntiTurnstileTask"
+        task["proxy"] = proxy
+    created = request(http, "POST", f"{CAPSOLVER}/createTask", json={"clientKey": api_key, "task": task}).json()
+    if created.get("errorId"):
+        raise CaptchaError(f"capsolver createTask failed: {created.get('errorDescription')}")
+    task_id = created.get("taskId")
+    if not task_id:
+        raise CaptchaError(f"capsolver createTask returned no taskId: {created}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll)
+        result = request(
+            http, "POST", f"{CAPSOLVER}/getTaskResult", json={"clientKey": api_key, "taskId": task_id}
+        ).json()
+        if result.get("errorId"):
+            raise CaptchaError(f"capsolver getTaskResult failed: {result.get('errorDescription')}")
+        if result.get("status") == "ready":
+            token = (result.get("solution") or {}).get("token", "")
+            if not token:
+                raise CaptchaError("capsolver solution carried no token")
+            return token
+    raise CaptchaError("capsolver solve timed out")
 
 
-class NoSolver(Solver):
-    provider = "none"
-
-
-class ManualSolver(Solver):
-    """`--captcha-key` 就是 token 本身。多账号时需要每号一个，所以用 `;` 分隔排队。"""
-
-    provider = "manual"
-
-    def __init__(self, cfg: CaptchaConfig, **kwargs: Any) -> None:
-        super().__init__(cfg, **kwargs)
-        self._tokens = [t.strip() for t in (cfg.api_key or "").split(";") if t.strip()]
-
-    def solve(self, *, page_url: str = "", action: str = "") -> str:
-        if not self._tokens:
-            raise CaptchaRequired("manual 模式需要 --captcha-key <turnstile token>")
-        return self._tokens.pop(0)
-
-
-class _ApiSolver(Solver):
-    """打码平台的公共骨架：createTask → poll → 拿 token。"""
-
-    create_url = ""
-    result_url = ""
-    task_type = ""
-
-    def __init__(self, cfg: CaptchaConfig, **kwargs: Any) -> None:
-        super().__init__(cfg, **kwargs)
-        if not cfg.api_key:
-            raise CaptchaRequired(f"{self.provider} 需要 --captcha-key")
-        self.client = build_client(proxy=self.proxy, timeout=30.0)
-
-    def _create_payload(self, page_url: str, action: str) -> dict[str, Any]:
-        raise NotImplementedError
-
-    def _result_payload(self, task_id: str) -> dict[str, Any]:
-        raise NotImplementedError
-
-    def _extract(self, payload: dict[str, Any]) -> str:
-        raise NotImplementedError
-
-    def solve(self, *, page_url: str = "", action: str = "") -> str:
-        page = page_url or self.cfg.page_url
-        created = request(self.client, "POST", self.create_url, json=self._create_payload(page, action))
-        data = created.json() if created.status_code == 200 else {}
-        task_id = str(data.get("taskId") or data.get("task_id") or "")
-        if not task_id:
-            raise CaptchaRequired(f"{self.provider} 建任务失败：{created.text[:200]}")
-        deadline = time.time() + self.cfg.timeout
-        while time.time() < deadline:
-            time.sleep(self.cfg.poll)
-            polled = request(self.client, "POST", self.result_url, json=self._result_payload(task_id))
-            if polled.status_code != 200:
-                continue
-            token = self._extract(polled.json())
-            if token:
+def _twocaptcha(
+    *,
+    api_key: str,
+    site_url: str,
+    site_key: str,
+    action: str,
+    proxy: str,
+    timeout: float,
+    poll: float,
+    client: Any,
+) -> str:
+    if not api_key:
+        raise CaptchaError("2captcha needs an api key")
+    http = client or build_client(proxy=proxy, timeout=40)
+    params: dict[str, Any] = {
+        "key": api_key,
+        "method": "turnstile",
+        "sitekey": site_key,
+        "pageurl": site_url,
+        "action": action,
+        "json": 1,
+    }
+    if proxy:
+        host, _, auth = proxy.split("://", 2)[-1].partition("@")
+        if auth:
+            user, _, secret = auth.partition(":")
+            params.update({"proxy": host, "proxytype": "HTTP", "proxyuser": user, "proxypass": secret})
+        else:
+            params.update({"proxy": host, "proxytype": "HTTP"})
+    created = request(http, "POST", f"{TWOCAPTCHA}/in.php", data=params).json()
+    if created.get("status") != 1:
+        raise CaptchaError(f"2captcha in.php failed: {created.get('request')}")
+    task_id = created.get("request")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll)
+        result = request(
+            http,
+            "GET",
+            f"{TWOCAPTCHA}/res.php",
+            params={"key": api_key, "action": "get", "id": task_id, "json": 1},
+        ).json()
+        if result.get("status") == 1 and isinstance(result.get("request"), str):
+            token = result["request"]
+            if token and not token.startswith("CAPCHA_NOT_READY"):
                 return token
-        raise CaptchaRequired(f"{self.provider} 超时未出 token（{self.cfg.timeout:.0f}s）")
+        elif result.get("request") not in ("CAPCHA_NOT_READY", None):
+            raise CaptchaError(f"2captcha res.php failed: {result.get('request')}")
+    raise CaptchaError("2captcha solve timed out")
 
 
-class CapSolver(_ApiSolver):
-    provider = "capsolver"
-    create_url = "https://api.capsolver.com/createTask"
-    result_url = "https://api.capsolver.com/getTaskResult"
-    task_type = "AntiTurnstileTaskProxyLess"
-
-    def _create_payload(self, page_url: str, action: str) -> dict[str, Any]:
-        task: dict[str, Any] = {
-            "type": self.task_type,
-            "websiteURL": page_url,
-            "websiteKey": self.cfg.site_key,
-        }
-        if action:
-            task["metadata"] = {"action": action}
-        return {"clientKey": self.cfg.api_key, "task": task}
-
-    def _result_payload(self, task_id: str) -> dict[str, Any]:
-        return {"clientKey": self.cfg.api_key, "taskId": task_id}
-
-    def _extract(self, payload: dict[str, Any]) -> str:
-        if str(payload.get("status", "")).lower() != "ready":
-            return ""
-        solution = payload.get("solution") or {}
-        return str(solution.get("token") or solution.get("gRecaptchaResponse") or "")
-
-
-class TwoCaptcha(_ApiSolver):
-    provider = "2captcha"
-    create_url = "https://api.2captcha.com/createTask"
-    result_url = "https://api.2captcha.com/getTaskResult"
-    task_type = "TurnstileTaskProxyless"
-
-    def _create_payload(self, page_url: str, action: str) -> dict[str, Any]:
-        task: dict[str, Any] = {
-            "type": self.task_type,
-            "websiteURL": page_url,
-            "websiteKey": self.cfg.site_key,
-        }
-        if action:
-            task["action"] = action
-        return {"clientKey": self.cfg.api_key, "task": task}
-
-    def _result_payload(self, task_id: str) -> dict[str, Any]:
-        return {"clientKey": self.cfg.api_key, "taskId": task_id}
-
-    def _extract(self, payload: dict[str, Any]) -> str:
-        if str(payload.get("status", "")).lower() != "ready":
-            return ""
-        return str((payload.get("solution") or {}).get("token") or "")
+_MINT_JS = """
+async (args) => {
+  const { siteKey, action } = args;
+  if (!window.turnstile) {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.async = true;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('turnstile script failed'));
+      document.head.appendChild(s);
+    });
+  }
+  const host = document.createElement('div');
+  host.id = '__nv_captcha';
+  host.style.position = 'fixed';
+  host.style.inset = '0';
+  host.style.zIndex = '2147483647';
+  document.body.appendChild(host);
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('turnstile mint timed out')), 120000);
+    try {
+      window.turnstile.render(host, {
+        sitekey: siteKey,
+        action,
+        theme: 'light',
+        callback: (token) => { clearTimeout(timer); resolve(token); },
+        'error-callback': () => { clearTimeout(timer); reject(new Error('turnstile error callback')); },
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+    }
+  });
+}
+"""
 
 
-class BrowserSolver(Solver):
-    """真机过 Turnstile：`browser` 必须是 browser.BrowserEngine 实例。"""
+def mint_with_browser(
+    *,
+    site_url: str,
+    site_key: str,
+    action: str = "signup",
+    proxy: str = "",
+    timeout: float = 180.0,
+    headless: bool = True,
+) -> str:
+    """在真实 origin 上渲染 widget，读 callback token。
 
-    provider = "browser"
+    Playwright 是可选依赖：协议腿永远不需要它，但干净的住宅 IP + 真浏览器
+    通常能直接过，不必付解题费。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # noqa: BLE001 - 可选依赖
+        raise CaptchaError(
+            "browser captcha provider needs playwright (pip install playwright && playwright install chromium)"
+        ) from exc
 
-    def solve(self, *, page_url: str = "", action: str = "") -> str:
-        if self.browser is None:
-            raise CaptchaRequired("browser 解题需要浏览器引擎")
-        token = self.browser.solve_turnstile(page_url or self.cfg.page_url, timeout=self.cfg.timeout)
-        if not token:
-            raise CaptchaRequired("浏览器里 Turnstile 没出 token")
-        return token
+    launch: dict[str, Any] = {"headless": headless}
+    if proxy:
+        launch["proxy"] = {"server": proxy}
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(**launch)
+        try:
+            context = browser.new_context(locale="en-US")
+            page = context.new_page()
+            page.goto(site_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            token = page.evaluate(_MINT_JS, {"siteKey": site_key, "action": action})
+            if not token:
+                raise CaptchaError("browser produced an empty turnstile token")
+            return str(token)
+        finally:
+            browser.close()
 
-
-def build_solver(cfg: CaptchaConfig, *, proxy: str = "", browser: Any = None) -> Solver:
-    provider = (cfg.provider or "none").lower()
-    if provider in ("", "none"):
-        return NoSolver(cfg, proxy=proxy)
-    if provider == "manual":
-        return ManualSolver(cfg, proxy=proxy)
-    if provider == "capsolver":
-        return CapSolver(cfg, proxy=proxy)
-    if provider == "2captcha":
-        return TwoCaptcha(cfg, proxy=proxy)
-    if provider == "browser":
-        return BrowserSolver(cfg, proxy=proxy, browser=browser)
-    if provider == "auto":
-        # auto：有 key 就上打码平台，没 key 且允许浏览器就浏览器过，否则不发 token。
-        if cfg.api_key:
-            return CapSolver(cfg, proxy=proxy)
-        if browser is not None:
-            return BrowserSolver(cfg, proxy=proxy, browser=browser)
-        return NoSolver(cfg, proxy=proxy)
-    raise CaptchaRequired(f"未知 captcha provider：{provider}")

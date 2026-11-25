@@ -10,12 +10,26 @@
     "models": "node src/index.mjs --list-models",
     "smoke": "node tests/smoke.mjs",
     "allmodels": "node src/allmodels-cli.mjs",
+    "cleverai": "node src/cleverai-cli.mjs",
     "moonai": "node src/moonai-cli.mjs",
     "mcp": "node src/allmodels-mcp.mjs",
     "test:allmodels": "node --test tests/allmodels-pool.test.mjs tests/allmodels-concurrency.test.mjs tests/allmodels-mcp.test.mjs && node tests/allmodels-e2e.mjs",
+    "test:cleverai": "node --test tests/cleverai-pool.test.mjs tests/cleverai-routes.test.mjs",
     "test:moonai": "node --test tests/moonai-pool.test.mjs tests/moonai-fork-surface.test.mjs tests/moonai-svelte-build.test.mjs && node tests/moonai-e2e.mjs && node tests/moonai-admin.test.mjs && node tests/moonai-worker-e2e.mjs",
-    "check:svelte": "node scripts/validate-svelte.mjs"
+    "check:svelte": "node scripts/validate-svelte.mjs",
+    "providers": "node src/provider-cli.mjs",
+    "mcp:providers": "node src/provider-mcp.mjs",
+    "test:providers": "node --test tests/providers-wavespeed-novita.test.mjs tests/novita-pool.test.mjs && python tools/wavespeed-reg/tests/test_offline.py && python tools/novita-reg/tests/test_offline.py",
+    "mcp:provider": "node src/provider-mcp.mjs",
+    "sandbox:sim": "node tools/novita-reg/sandbox-sim.mjs",
+    "test:novita": "node --test tests/novita-pool.test.mjs && python -m pytest tools/novita-reg/tests -q",
+    "test:blackbox": "node --test tests/blackbox-provider.test.mjs && python -m unittest discover -s tools/blackbox-reg/tests && node tests/blackbox-e2e.mjs",
+    "blackbox": "cd tools/blackbox-reg && python -m blackbox_reg"
   },
-  "engines": { "node": ">=20" },
-  "dependencies": { "undici": "^7.0.0" }
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "undici": "^7.0.0"
+  }
 }

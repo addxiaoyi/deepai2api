@@ -1,0 +1,17 @@
+# Novita 注册 worker 的运行依赖。
+#
+# 协议腿只需要 httpx + pyyaml；浏览器腿（--engine browser / auto 回落）才需要
+# 下面注释里的内核，按需装一个即可，不必全装。
+#
+#   pip install -r requirements.txt
+#
+httpx>=0.27
+PyYAML>=6.0
+
+# ---- 浏览器腿（可选，任选其一）----
+# Camoufox（Firefox 内核，指纹改写最彻底，托管挑战通过率最高）
+#   pip install camoufox && python -m camoufox fetch
+# Patchright（Playwright 反检测分支，Chromium）
+#   pip install patchright && patchright install chromium
+# 官方 Playwright（兜底）
+#   pip install playwright && playwright install chromium

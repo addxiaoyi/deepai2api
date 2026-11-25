@@ -53,8 +53,11 @@ import httpx
 from .errors import (
     Blocked,
     CaptchaRequired,
+    EmailRejected,
+    EmailTaken,
     KeyNotObtainable,
     NoApiKey,
+    PasswordRejected,
     RateLimited,
     SignupError,
     Transport,
@@ -81,6 +84,31 @@ DASHBOARD = "/dashboard"
 _CF_MARKERS = ("just a moment", "cf-browser-verification", "challenge-platform", "attention required")
 _TURNSTILE_SITE_RE = re.compile(r"""sitekey["'\s:]+["'](0x4AAAAAA[A-Za-z0-9_-]+)["']""", re.I)
 
+# 面板错误码 → runner 词汇。WaveSpeed 的码是蛇形小写，也接受"人话"消息。
+_EMAIL_TAKEN_CODES = (
+    "email_already_exists",
+    "email_exists",
+    "user_already_exists",
+    "user_exists",
+    "already_registered",
+    "account_exists",
+)
+_EMAIL_BAD_CODES = (
+    "invalid_email",
+    "email_not_allowed",
+    "disposable_email",
+    "email_rejected",
+    "email_invalid",
+    "domain_not_allowed",
+)
+_PASSWORD_BAD_CODES = (
+    "password_too_short",
+    "password_too_long",
+    "invalid_password",
+    "password_compromised",
+    "weak_password",
+)
+
 
 def _looks_blocked(response: httpx.Response) -> bool:
     if response.status_code in (403, 503) and "cloudflare" in response.headers.get("server", "").lower():
@@ -102,7 +130,12 @@ def _error_code(response: httpx.Response) -> tuple[str, str]:
 
 
 def _raise_for(path: str, response: httpx.Response) -> None:
-    """把一个失败的调用翻译成 runner 认识的重试词汇。"""
+    """把一个失败的调用翻译成 runner 认识的重试词汇。
+
+    顺序很重要：先判"这道门我们过不去"（挑战 / 限流 / 验证码），再判"这个地址
+    有问题"（已被注册 / 被拒 / 密码不合规），最后才是通用的 401/403 与兜底。
+    否则 409 的 `email_already_exists` 会被上一层的通用分支吃掉。
+    """
     code, message = _error_code(response)
     lowered = f"{code} {message}".lower()
     status = response.status_code
@@ -114,6 +147,14 @@ def _raise_for(path: str, response: httpx.Response) -> None:
         raise RateLimited(f"{path}: rate limited", detail=detail)
     if "captcha" in lowered or "turnstile" in lowered:
         raise CaptchaRequired(f"{path}: captcha rejected the token ({message or code})", detail=detail)
+
+    if any(k in lowered for k in _EMAIL_TAKEN_CODES) or "already exists" in lowered or "already registered" in lowered:
+        raise EmailTaken(f"{path}: address already registered", detail=detail)
+    if any(k in lowered for k in _EMAIL_BAD_CODES) or "invalid email" in lowered or "not allowed" in lowered:
+        raise EmailRejected(f"{path}: address rejected ({message or code})", detail=detail)
+    if any(k in lowered for k in _PASSWORD_BAD_CODES):
+        raise PasswordRejected(f"{path}: password rejected ({message or code})", detail=detail)
+
     if status in (401, 403):
         raise SignupError(f"{path}: not authorised (HTTP {status})", detail=detail)
     raise SignupError(f"{path}: failed (HTTP {status})", detail=detail)

@@ -1,388 +1,396 @@
-"""邮箱：域名 catch-all（首选）/ IMAP 固定信箱 / mail.tm / tempmail.lol。
+"""域名邮箱 / 临时邮箱提供者 —— 注册地址（以及验证邮件）从哪来。
 
-为什么域名邮箱是首选：Novita 对一次性域名有名单（实测 `CLOUDFLARE_CHECK_ERROR`
-之外最常见的拒绝就是域名被判不可用），而自有 catch-all 域名是"真域名"，
-且能无限造 local part。IMAP 只负责**收信**，注册地址仍然是 `<local>@<domain>`。
+四个来源，按"耐用程度"排序：
 
-接口统一成三件事：
-    mailbox.address          当前收信地址
-    mailbox.wait_for_code()  等激活邮件，返回可点链接 / 验证码
-    mailbox.close()
+  imap         : 自有 catch-all 域名（最耐用，能过大多数一次性域名黑名单）
+  fixed        : 一个自己控制的地址，按 plus 分号给每个账号
+  mailtm       : 公共 API，盒子约 7 天
+  tempmail_lol : 公共 API，每次随机域名
 
-所有 provider 都遵守 `verify_timeout`，超时抛 VerificationPending。
+WaveSpeed 本身没有邮箱验证环节（OAuth 由 Google/GitHub 提供），但：
+  * OAuth 提供方可能要求邮箱是"可控"的（GitHub 注册要验证邮箱）；
+  * novita 这类站点要验证链接，同一套 Provider 接口在两边通用；
+所以这里保留完整实现，`wait_for_link` 的 must_contain 由调用方决定。
 """
 
 from __future__ import annotations
 
-import imaplib
 import email
-import email.policy
+import imaplib
 import random
 import re
+import string
+import threading
 import time
-from dataclasses import dataclass
-from email.message import EmailMessage
-from typing import Any, Iterable
+from dataclasses import dataclass, field
+from typing import Any
 
-import httpx
-
-from .errors import SignupError, VerificationPending
-from .identity import make_persona
+from .errors import SignupError, Transport
 from .net import build_client, request
 
-CODE_RE = re.compile(r"\b(\d{6})\b")
-LINK_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
+TEMPMAIL_API = "https://api.tempmail.lol/v2"
+MAILTM_API = "https://api.mail.tm"
+
+# 多线程同时建盒子时公共 API 会直接 429；全局节流。
+_create_lock = threading.Lock()
+_last_create = 0.0
+CREATE_INTERVAL = 1.5
 
 
-@dataclass
-class InboxMessage:
-    subject: str
-    body: str
-    received: float
-
-    def links(self) -> list[str]:
-        return [m.group(0) for m in LINK_RE.finditer(self.body)]
-
-    def codes(self) -> list[str]:
-        return [m.group(1) for m in CODE_RE.finditer(self.body)]
+def _pace() -> None:
+    global _last_create
+    with _create_lock:
+        wait = CREATE_INTERVAL - (time.time() - _last_create)
+        if wait > 0:
+            time.sleep(wait)
+        _last_create = time.time()
 
 
-def _html_to_text(html: str) -> str:
-    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</p>", "\n", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"[ \t]{2,}", " ", text)
+def _post_with_retry(client: Any, url: str, *, json_body: dict, tries: int = 4) -> Any:
+    response = None
+    for attempt in range(tries):
+        _pace()
+        response = request(client, "POST", url, json=json_body)
+        if response.status_code != 429:
+            return response
+        time.sleep(2.5 * (attempt + 1))
+    return response
 
 
-def _extract(message: EmailMessage) -> str:
-    """把一封邮件压成纯文本，链接与验证码都能正则命中。"""
-    chunks: list[str] = []
-    if message.is_multipart():
-        for part in message.walk():
-            ctype = part.get_content_type()
-            if ctype not in ("text/plain", "text/html"):
-                continue
-            try:
-                payload = part.get_content()
-            except (LookupError, ValueError):
-                payload = part.get_payload(decode=True) or b""
-                if isinstance(payload, bytes):
-                    payload = payload.decode(part.get_content_charset() or "utf-8", "replace")
-            chunks.append(_html_to_text(payload) if ctype == "text/html" else str(payload))
-    else:
-        try:
-            payload = message.get_content()
-        except (LookupError, ValueError):
-            raw = message.get_payload(decode=True) or b""
-            payload = raw.decode(message.get_content_charset() or "utf-8", "replace")
-        chunks.append(str(payload))
-    return "\n".join(chunks)
+@dataclass(slots=True)
+class Mailbox:
+    address: str
+    provider: str
+    token: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
-class BaseMailbox:
-    provider = "base"
+@dataclass(slots=True)
+class Message:
+    subject: str = ""
+    sender: str = ""
+    body: str = ""
+    html: str = ""
+    received: str = ""
 
-    def __init__(self, *, verify_timeout: float = 180.0, poll: float = 4.0, proxy: str = "") -> None:
-        self.verify_timeout = float(verify_timeout)
-        self.poll = float(poll)
-        self.proxy = proxy
-        self.address = ""
 
-    # -- 子类实现 ---------------------------------------------------------
-    def _fetch(self, since: float) -> Iterable[InboxMessage]:
-        return ()
+class Provider:
+    name = "base"
 
-    def _cleanup(self) -> None:
-        return None
+    def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:  # pragma: no cover - interface
+        raise NotImplementedError
 
-    # -- 公共 -------------------------------------------------------------
-    def messages(self, since: float = 0.0) -> list[InboxMessage]:
-        try:
-            rows = list(self._fetch(since))
-        except SignupError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - 邮箱 API 的异常太杂
-            raise SignupError(f"mailbox fetch failed: {exc.__class__.__name__}: {exc}") from exc
-        return sorted(rows, key=lambda m: m.received)
-
-    def wait_for(self, *, keywords: Iterable[str] = ("novita", "activate", "verify"), since: float | None = None) -> InboxMessage:
-        """等一封含关键词的邮件；超时抛 VerificationPending。"""
-        needles = tuple(k.lower() for k in keywords)
-        started = time.time()
-        since_ts = since if since is not None else started - 5
-        while time.time() - started < self.verify_timeout:
-            for message in reversed(self.messages(since_ts)):
-                haystack = f"{message.subject}\n{message.body}".lower()
-                if not needles or any(n in haystack for n in needles):
-                    return message
-            time.sleep(self.poll)
-        raise VerificationPending(
-            f"{self.address}: 等激活邮件超时（{self.verify_timeout:.0f}s）",
-            detail={"provider": self.provider, "address": self.address},
-        )
-
-    def activation_link(self, message: InboxMessage, *, must_contain: str = "") -> str:
-        """从邮件里挑出真正能激活的那条链接。"""
-        links = message.links()
-        for link in links:
-            lowered = link.lower()
-            if must_contain and must_contain.lower() not in lowered:
-                continue
-            if any(hint in lowered for hint in ("activate", "active", "verify", "token", "confirm")):
-                return link
-        for link in links:
-            if "novita" in link.lower():
-                return link
-        return links[0] if links else ""
+    def messages(self, box: Mailbox) -> list[Message]:  # pragma: no cover - interface
+        raise NotImplementedError
 
     def close(self) -> None:
-        self._cleanup()
+        return None
+
+    def domains(self) -> list[str]:
+        return []
+
+    # ------------------------------------------------------------- utilities
+    def wait_for_link(
+        self,
+        box: Mailbox,
+        *,
+        timeout: float = 180.0,
+        pattern: str = r"https?://[^\s\"'<>]+",
+        must_contain: tuple[str, ...] = ("verify", "token"),
+        poll: float = 5.0,
+    ) -> str:
+        """收件箱里第一个像"确认链接"的 URL。"""
+        deadline = time.time() + timeout
+        seen: set[str] = set()
+        while time.time() < deadline:
+            for message in self.messages(box):
+                blob = f"{message.body}\n{message.html}"
+                for link in re.findall(pattern, blob.replace("&amp;", "&")):
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    lowered = link.lower()
+                    if not must_contain or any(k in lowered for k in must_contain):
+                        return link
+            time.sleep(poll)
+        return ""
 
 
-class DomainMailbox(BaseMailbox):
-    """自有域名 catch-all：造地址不花钱，收信走 IMAP。
+class TempmailLol(Provider):
+    """https://tempmail.lol —— POST /inbox/create, GET /inbox?token="""
 
-    这是唯一能"无限注册"的形态 —— 其它免费 API 都按 IP 限流。
-    """
+    name = "tempmail_lol"
 
-    provider = "domain"
+    def __init__(self, *, domain: str = "", proxy: str = "", timeout: float = 30.0) -> None:
+        self.domain = domain
+        self.client = build_client(proxy=proxy, timeout=timeout)
+
+    def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:
+        payload: dict[str, str] = {}
+        chosen = (domain or self.domain).strip()
+        if chosen:
+            payload["domain"] = chosen
+        response = _post_with_retry(self.client, f"{TEMPMAIL_API}/inbox/create", json_body=payload)
+        if response.status_code >= 400:
+            raise SignupError(
+                f"tempmail.lol refused to create a box (HTTP {response.status_code})",
+                detail=response.text[:200],
+            )
+        data = response.json()
+        address = str(data.get("address", ""))
+        if "@" not in address:
+            raise SignupError("tempmail.lol returned no usable address", detail=str(data)[:200])
+        return Mailbox(address=address, provider=self.name, token=str(data.get("token", "")))
+
+    def messages(self, box: Mailbox) -> list[Message]:
+        if not box.token:
+            return []
+        response = request(self.client, "GET", f"{TEMPMAIL_API}/inbox", params={"token": box.token})
+        if response.status_code >= 400:
+            return []
+        out: list[Message] = []
+        for item in (response.json() or {}).get("emails") or []:
+            out.append(
+                Message(
+                    subject=str(item.get("subject", "")),
+                    sender=str(item.get("from", "")),
+                    body=str(item.get("body", "")),
+                    html=str(item.get("html", "")),
+                    received=str(item.get("date", "")),
+                )
+            )
+        return out
+
+    def close(self) -> None:
+        self.client.close()
+
+    def domains(self) -> list[str]:
+        return [self.domain] if self.domain else []
+
+
+class MailTm(Provider):
+    """https://mail.tm —— 先建账号，再用 JWT 读信。"""
+
+    name = "mailtm"
+
+    def __init__(self, *, domain: str = "", proxy: str = "", timeout: float = 30.0) -> None:
+        self.domain = domain
+        self.client = build_client(proxy=proxy, timeout=timeout)
+
+    def _domain(self) -> str:
+        if self.domain:
+            return self.domain
+        response = request(self.client, "GET", f"{MAILTM_API}/domains", params={"page": 1})
+        if response.status_code >= 400:
+            raise SignupError(f"mail.tm domain list failed (HTTP {response.status_code})")
+        members = (response.json() or {}).get("hydra:member") or []
+        active = [m for m in members if m.get("isActive")]
+        if not active:
+            raise SignupError("mail.tm has no active domain right now")
+        return str(active[0]["domain"])
+
+    def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:
+        domain = domain or self._domain()
+        local = local_part or "u" + "".join(random.choices(string.ascii_lowercase + string.digits, k=9))
+        local = re.sub(r"[^a-z0-9._-]", "", local.lower())[:32] or "u" + str(int(time.time()))
+        address = f"{local}@{domain}"
+        password = "M" + "".join(random.choices(string.ascii_letters + string.digits, k=14)) + "!7"
+        created = _post_with_retry(
+            self.client, f"{MAILTM_API}/accounts", json_body={"address": address, "password": password}
+        )
+        if created.status_code not in (200, 201):
+            raise SignupError(f"mail.tm refused the box (HTTP {created.status_code})", detail=created.text[:200])
+        token = request(self.client, "POST", f"{MAILTM_API}/token", json={"address": address, "password": password})
+        if token.status_code >= 400:
+            raise SignupError(f"mail.tm token failed (HTTP {token.status_code})")
+        return Mailbox(
+            address=address,
+            provider=self.name,
+            token=str(token.json().get("token", "")),
+            meta={"password": password},
+        )
+
+    def messages(self, box: Mailbox) -> list[Message]:
+        headers = {"Authorization": f"Bearer {box.token}"}
+        listing = request(self.client, "GET", f"{MAILTM_API}/messages", headers=headers)
+        if listing.status_code >= 400:
+            return []
+        out: list[Message] = []
+        for item in listing.json() or []:
+            detail = request(self.client, "GET", f"{MAILTM_API}/messages/{item['id']}", headers=headers)
+            body = ""
+            html = ""
+            if detail.status_code < 400:
+                payload = detail.json() or {}
+                html = "\n".join(payload.get("html") or [])
+                body = "\n".join(payload.get("text") or [])
+            out.append(
+                Message(
+                    subject=str(item.get("subject", "")),
+                    sender=str((item.get("from") or {}).get("address", "")),
+                    body=body,
+                    html=html,
+                    received=str(item.get("createdAt", "")),
+                )
+            )
+        return out
+
+    def close(self) -> None:
+        self.client.close()
+
+    def domains(self) -> list[str]:
+        try:
+            response = request(self.client, "GET", f"{MAILTM_API}/domains", params={"page": 1})
+            if response.status_code >= 400:
+                return []
+            members = (response.json() or {}).get("hydra:member") or []
+            return [str(m["domain"]) for m in members if m.get("isActive")]
+        except SignupError:
+            return []
+
+
+class ImapCatchAll(Provider):
+    """自有域名 + catch-all 规则；用 IMAPS 轮询收件箱。"""
+
+    name = "imap"
 
     def __init__(
         self,
         *,
+        host: str,
+        user: str,
+        password: str,
         domain: str,
-        imap_host: str,
-        imap_port: int = 993,
-        imap_user: str = "",
-        imap_password: str = "",
-        address: str = "",
-        local_prefix: str = "",
-        verify_timeout: float = 180.0,
-        poll: float = 4.0,
-        proxy: str = "",
+        prefix: str = "",
+        port: int = 993,
+        timeout: float = 30.0,
     ) -> None:
-        super().__init__(verify_timeout=verify_timeout, poll=poll, proxy=proxy)
-        self.domain = domain.strip().lower()
-        self.imap_host = imap_host
-        self.imap_port = int(imap_port or 993)
-        self.imap_user = imap_user or address or f"inbox@{self.domain}"
-        self.imap_password = imap_password
-        self._conn: imaplib.IMAP4_SSL | None = None
-        if address:
-            self.address = address
-        else:
-            persona = make_persona(domain=self.domain, local_prefix=local_prefix)
-            self.address = persona.email
+        if not (host and user and password and domain):
+            raise SignupError("imap provider needs host, user, password and domain")
+        self.host = host
+        self.user = user
+        self.password = password
+        self.domain = domain
+        self.prefix = prefix
+        self.port = port
+        self.timeout = timeout
 
-    def _connect(self) -> imaplib.IMAP4_SSL:
-        if self._conn is not None:
-            return self._conn
-        if not self.imap_host:
-            raise SignupError("domain 邮箱缺 imap_host：只能收信，不能注册", detail={"domain": self.domain})
-        conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, timeout=30)
-        conn.login(self.imap_user, self.imap_password)
-        conn.select("INBOX")
-        self._conn = conn
-        return conn
+    def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:
+        tag = local_part or "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        tag = re.sub(r"[^a-z0-9._-]", "", tag.lower())
+        address = f"{self.prefix}{tag}@{domain or self.domain}"
+        return Mailbox(address=address, provider=self.name, token=tag)
 
-    def _fetch(self, since: float) -> Iterable[InboxMessage]:
-        conn = self._connect()
-        # IMAP 的 SINCE 只到天粒度；用当天 + 本地时间过滤兜底。
-        day = time.strftime("%d-%b-%Y", time.localtime(since - 86400))
-        typ, data = conn.search(None, f'(SINCE "{day}")')
-        if typ != "OK":
-            return []
-        ids = (data[0] or b"").split()
-        out: list[InboxMessage] = []
-        for raw_id in ids[-40:]:
-            typ, payload = conn.fetch(raw_id, "(RFC822)")
-            if typ != "OK" or not payload:
-                continue
-            blob = payload[0]
-            if not isinstance(blob, tuple):
-                continue
-            message = email.message_from_bytes(blob[1], policy=email.policy.default)
-            to_header = str(message.get("To", "")).lower()
-            if self.address.lower() not in to_header and self.domain not in to_header:
-                continue
-            received = time.time()
-            out.append(InboxMessage(subject=str(message.get("Subject", "")), body=_extract(message), received=received))
-        return out
-
-    def _cleanup(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.logout()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-
-
-class MailTmMailbox(BaseMailbox):
-    """mail.tm：免费、无需 key，但按 IP 限流，且域名会被站点拉黑。"""
-
-    provider = "mailtm"
-    BASE = "https://api.mail.tm"
-
-    def __init__(self, *, domain: str = "", verify_timeout: float = 180.0, poll: float = 4.0, proxy: str = "") -> None:
-        super().__init__(verify_timeout=verify_timeout, poll=poll, proxy=proxy)
-        self.client = build_client(proxy=proxy, timeout=30.0, base_url=self.BASE)
-        self.token = ""
-        self._bootstrap(domain)
-
-    def _domains(self) -> list[str]:
-        response = request(self.client, "GET", "/domains?page=1")
-        data = response.json() if response.status_code == 200 else {}
-        rows = data.get("hydra:member") if isinstance(data, dict) else None
-        return [row.get("domain", "") for row in (rows or []) if row.get("domain")]
-
-    def _bootstrap(self, domain: str) -> None:
-        candidates = [domain] if domain else self._domains()
-        if not candidates:
-            raise SignupError("mail.tm 没有可用域名")
-        last_error = ""
-        for candidate in candidates[:6]:
-            persona = make_persona(domain=candidate)
-            password = persona.password
-            created = request(
-                self.client,
-                "POST",
-                "/accounts",
-                json={"address": persona.email, "password": password},
-            )
-            if created.status_code not in (200, 201):
-                last_error = created.text[:200]
-                continue
-            token = request(self.client, "POST", "/token", json={"address": persona.email, "password": password})
-            if token.status_code != 200:
-                last_error = token.text[:200]
-                continue
-            self.token = token.json().get("token", "")
-            self.address = persona.email
-            self.client.headers["Authorization"] = f"Bearer {self.token}"
-            return
-        raise SignupError(f"mail.tm 建信箱失败：{last_error}")
-
-    def _fetch(self, since: float) -> Iterable[InboxMessage]:
-        listing = request(self.client, "GET", "/messages?page=1")
-        if listing.status_code != 200:
-            return []
-        rows = listing.json().get("hydra:member") or []
-        out: list[InboxMessage] = []
-        for row in rows[:20]:
-            msg_id = row.get("id")
-            if not msg_id:
-                continue
-            detail = request(self.client, "GET", f"/messages/{msg_id}")
-            if detail.status_code != 200:
-                continue
-            data = detail.json()
-            body = "\n".join(
-                part for part in (data.get("text") or "", _html_to_text(data.get("html") or "")) if part
-            )
-            out.append(
-                InboxMessage(
-                    subject=str(data.get("subject") or ""),
-                    body=body,
-                    received=time.time(),
-                )
-            )
-        return out
-
-    def _cleanup(self) -> None:
+    def messages(self, box: Mailbox) -> list[Message]:
+        out: list[Message] = []
+        handle: imaplib.IMAP4_SSL | None = None
         try:
-            self.client.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-class TempMailLolMailbox(BaseMailbox):
-    """tempmail.lol：一次调用拿地址，轮询 /inbox。域名多为一次性，容易被拒。"""
-
-    provider = "tempmail_lol"
-    BASE = "https://api.tempmail.lol/v2"
-
-    def __init__(self, *, domain: str = "", verify_timeout: float = 180.0, poll: float = 4.0, proxy: str = "") -> None:
-        super().__init__(verify_timeout=verify_timeout, poll=poll, proxy=proxy)
-        self.client = build_client(proxy=proxy, timeout=30.0)
-        body: dict[str, Any] = {}
-        if domain:
-            body["domain"] = domain
-        response = request(self.client, "POST", f"{self.BASE}/inbox/create", json=body or None)
-        if response.status_code not in (200, 201):
-            raise SignupError(f"tempmail.lol 建信箱失败：HTTP {response.status_code} {response.text[:160]}")
-        data = response.json()
-        self.address = str(data.get("address") or "")
-        self.token = str(data.get("token") or "")
-        if not (self.address and self.token):
-            raise SignupError("tempmail.lol 返回缺 address/token")
-
-    def _fetch(self, since: float) -> Iterable[InboxMessage]:
-        response = request(self.client, "GET", f"{self.BASE}/inbox?token={self.token}")
-        if response.status_code != 200:
-            return []
-        data = response.json()
-        out: list[InboxMessage] = []
-        for row in (data.get("emails") or [])[:20]:
-            out.append(
-                InboxMessage(
-                    subject=str(row.get("subject") or ""),
-                    body="\n".join(
-                        part for part in (row.get("body") or "", _html_to_text(row.get("html") or "")) if part
-                    ),
-                    received=float(row.get("date") or time.time()),
+            handle = imaplib.IMAP4_SSL(self.host, self.port)
+            handle.login(self.user, self.password)
+            handle.select("INBOX")
+            query = f'(TO "{box.address}")'
+            status, data = handle.search(None, "UNSEEN", query)
+            if status != "OK":
+                status, data = handle.search(None, query)
+            ids = (data[0] or b"").split()
+            for msg_id in ids[-10:]:
+                status, payload = handle.fetch(msg_id, "(RFC822)")
+                if status != "OK" or not payload or not isinstance(payload[0], tuple):
+                    continue
+                parsed = email.message_from_bytes(payload[0][1])
+                body = ""
+                html = ""
+                if parsed.is_multipart():
+                    for part in parsed.walk():
+                        ctype = part.get_content_type()
+                        try:
+                            chunk = part.get_payload(decode=True) or b""
+                        except Exception:  # noqa: BLE001 - MIME 畸形很常见
+                            continue
+                        text = chunk.decode(part.get_content_charset() or "utf-8", "replace")
+                        if ctype == "text/html":
+                            html += text
+                        elif ctype == "text/plain":
+                            body += text
+                else:
+                    chunk = parsed.get_payload(decode=True) or b""
+                    body = chunk.decode(parsed.get_content_charset() or "utf-8", "replace")
+                out.append(
+                    Message(
+                        subject=str(parsed.get("subject", "")),
+                        sender=str(parsed.get("from", "")),
+                        body=body,
+                        html=html,
+                        received=str(parsed.get("date", "")),
+                    )
                 )
-            )
+        except (imaplib.IMAP4.error, OSError, Transport) as exc:
+            raise Transport(f"imap poll failed: {exc}") from exc
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001 - 死会话上 close 会抛
+                    pass
+                try:
+                    handle.logout()
+                except Exception:  # noqa: BLE001
+                    pass
         return out
 
-    def _cleanup(self) -> None:
-        try:
+    def domains(self) -> list[str]:
+        return [self.domain] if self.domain else []
+
+
+class FixedAddress(Provider):
+    """一个自己控制的地址；每个账号一个 plus 标签。"""
+
+    name = "fixed"
+
+    def __init__(self, *, address: str, messages: list[Message] | None = None, proxy: str = "", timeout: float = 30.0) -> None:
+        if "@" not in address:
+            raise SignupError("fixed provider needs a full address (user@domain)")
+        self.address = address
+        self.client = build_client(proxy=proxy, timeout=timeout) if proxy else None
+        self._messages = list(messages or [])
+
+    def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:
+        user, host = self.address.split("@", 1)
+        tag = local_part or "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        tag = re.sub(r"[^a-z0-9._-]", "", tag.lower())
+        base = user.split("+", 1)[0]
+        return Mailbox(address=f"{base}+{tag}@{host}", provider=self.name, token=tag)
+
+    def feed(self, messages: list[Message]) -> None:
+        """测试钩子：假装收件箱里已经有这些信。"""
+        self._messages = list(messages)
+
+    def messages(self, box: Mailbox) -> list[Message]:
+        return list(self._messages)
+
+    def close(self) -> None:
+        if self.client is not None:
             self.client.close()
-        except Exception:  # noqa: BLE001
-            pass
+
+    def domains(self) -> list[str]:
+        return [self.address.split("@", 1)[1]]
 
 
-class FixedMailbox(DomainMailbox):
-    """固定地址 + plus 分号：`you+tag@domain`。适合自测与"一个信箱多账号"。"""
-
-    provider = "fixed"
-
-    def __init__(self, *, address: str, **kwargs: Any) -> None:
-        domain = address.split("@")[-1]
-        super().__init__(address=address, domain=domain, **kwargs)
-
-
-def build_mailbox(cfg: Any, *, proxy: str = "", rng: random.Random | None = None) -> BaseMailbox:
-    """按配置造信箱。`cfg` 是 Config（含 mail / anti_ban）。"""
-    mail = cfg.mail
-    common = {"verify_timeout": mail.verify_timeout, "proxy": proxy}
-    provider = (mail.provider or "domain").lower()
-    if provider in ("domain", "imap"):
-        domain = mail.domain
-        if not domain and mail.domains:
-            rng = rng or random.Random()
-            domain = rng.choice(mail.domains)
-        return DomainMailbox(
-            domain=domain,
-            imap_host=mail.imap_host,
-            imap_port=mail.imap_port,
-            imap_user=mail.imap_user,
-            imap_password=mail.imap_password,
-            local_prefix=mail.prefix,
-            **common,
+def build_provider(mail_cfg: Any, *, proxy: str = "") -> Provider:
+    name = (getattr(mail_cfg, "provider", "") or "imap").strip().lower()
+    if name in ("imap", "domain"):
+        return ImapCatchAll(
+            host=mail_cfg.imap_host,
+            user=mail_cfg.imap_user,
+            password=mail_cfg.imap_password,
+            domain=mail_cfg.domain or (mail_cfg.domains[0] if mail_cfg.domains else ""),
+            prefix=mail_cfg.prefix,
+            port=mail_cfg.imap_port,
         )
-    if provider == "fixed":
-        return FixedMailbox(
-            address=mail.address or f"inbox@{mail.domain or 'example.com'}",
-            imap_host=mail.imap_host,
-            imap_port=mail.imap_port,
-            imap_user=mail.imap_user,
-            imap_password=mail.imap_password,
-            **common,
-        )
-    if provider == "mailtm":
-        return MailTmMailbox(domain=mail.domain, **common)
-    if provider == "tempmail_lol":
-        return TempMailLolMailbox(domain=mail.domain, **common)
-    raise SignupError(f"未知邮箱 provider：{provider}")
+    if name == "tempmail_lol":
+        return TempmailLol(domain=mail_cfg.domain, proxy=proxy)
+    if name == "mailtm":
+        return MailTm(domain=mail_cfg.domain, proxy=proxy)
+    if name == "fixed":
+        return FixedAddress(address=mail_cfg.address, proxy=proxy)
+    raise SignupError(f"unknown mail provider: {getattr(mail_cfg, 'provider', '')}")

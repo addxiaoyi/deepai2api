@@ -182,27 +182,41 @@ class MailTm(Provider):
 
     def allocate(self, local_part: str = "", domain: str = "") -> Mailbox:
         domain = domain or self._domain()
-        local = (local_part or "u" + "".join(random.choices(string.ascii_lowercase + string.digits, k=9)))
-        local = re.sub(r"[^a-z0-9._-]", "", local.lower())[:32] or "u" + str(int(time.time()))
-        address = f"{local}@{domain}"
-        password = "M" + "".join(random.choices(string.ascii_letters + string.digits, k=14)) + "!7"
-        created = _post_with_retry(self.client, f"{MAILTM_API}/accounts", json_body={"address": address, "password": password})
-        if created.status_code not in (200, 201):
-            raise SignupError(f"mail.tm refused the box (HTTP {created.status_code})", detail=(created.text or "")[:200])
-        token = request(
-            self.client,
-            "POST",
-            f"{MAILTM_API}/token",
-            json={"address": address, "password": password, "identifier": address},
-        )
-        if token.status_code >= 400:
-            raise SignupError(f"mail.tm token failed (HTTP {token.status_code})")
-        return Mailbox(
-            address=address,
-            provider=self.name,
-            token=str(token.json().get("token", "")),
-            meta={"password": password},
-        )
+        base = (local_part or "u" + "".join(random.choices(string.ascii_lowercase + string.digits, k=9)))
+        base = re.sub(r"[^a-z0-9._-]", "", base.lower())[:32] or "u" + str(int(time.time()))
+        last_error = ""
+        # mail.tm answers 422 for an address it already knows or finds malformed;
+        # falling back to a plain random local part beside the same domain clears it.
+        candidates = [
+            base,
+            re.sub(r"[^a-z0-9]", "", base) or "u" + str(int(time.time())),
+            "u" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12)),
+        ]
+        for candidate in candidates:
+            address = f"{candidate}@{domain}"
+            password = "M" + "".join(random.choices(string.ascii_letters + string.digits, k=14)) + "!7"
+            created = _post_with_retry(
+                self.client, f"{MAILTM_API}/accounts", json_body={"address": address, "password": password}
+            )
+            if created.status_code not in (200, 201):
+                last_error = f"HTTP {created.status_code} {(created.text or '')[:120]}"
+                continue
+            token = request(
+                self.client,
+                "POST",
+                f"{MAILTM_API}/token",
+                json={"address": address, "password": password, "identifier": address},
+            )
+            if token.status_code >= 400:
+                last_error = f"token HTTP {token.status_code}"
+                continue
+            return Mailbox(
+                address=address,
+                provider=self.name,
+                token=str(token.json().get("token", "")),
+                meta={"password": password},
+            )
+        raise SignupError(f"mail.tm refused the box ({last_error})")
 
     def messages(self, box: Mailbox) -> list[Message]:
         headers = {"Authorization": f"Bearer {box.token}"}

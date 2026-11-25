@@ -1,0 +1,70 @@
+# cleverai-reg 配置示例。复制成 config.yaml 再改。
+# 所有字段都可以用环境变量覆盖（CLEVERAI_* 前缀），网关子进程也会把
+# 面板传进来的参数拼成命令行。
+
+base_url: https://cleverai.app
+api_base: https://api.cleverai.app
+
+engine: auto          # auto | protocol | browser
+count: 1
+concurrency: 2
+attempts: 3
+retry_rounds: 1
+timeout: 60
+language: en-US
+verify_email: true
+chat_engine: openai-gpt-6-luna   # 预热 + 网关默认模型都读这里
+output_dir: out
+
+# 出口：住宅代理为王。一个出口同时只跑一个 signup。
+proxies: []
+proxy_rotate: true
+
+# ---------------------------------------------------------------- 域名邮箱
+mail:
+  provider: imap            # imap（catch-all 域名）| fixed | mailtm | tempmail_lol
+  domain: example.com       # 你的 catch-all 域
+  domains: []               # 多域名轮换；跑满 burst 就换下一个
+  prefix: ""                # 可选：统一本地部分前缀
+  address: ""               # provider=fixed 时填一个你拥有的完整地址
+  imap_host: imap.example.com
+  imap_port: 993
+  imap_user: bot@example.com
+  imap_password: ""
+  verify_timeout: 180
+
+# ------------------------------------------------------- Firebase App Check
+# 这是唯一绕不过去的门：没有它 appserver 一律 401。
+appcheck:
+  provider: browser         # browser（Camoufox 开一次站点读令牌）| capsolver | manual
+  api_key: ""               # capsolver 的 clientKey
+  token: ""                 # manual：直接给一枚现成 JWT
+  ttl: 3300
+  timeout: 180
+
+# ---------------------------------------------------------- 指纹浏览器
+browser:
+  stack: auto               # auto | camoufox | patchright | playwright
+  headless: true
+  cdp: ""                   # 接管指纹浏览器：http://127.0.0.1:50325
+  humanize: 1.0
+  geoip: true
+  screenshots: true
+  profile_dir: ""           # 留空 = 每个账号全新上下文
+  timeout: 120
+
+# -------------------------------------------------------------- 防封策略
+antiban:
+  min_delay: 25             # 两个账号之间的最小间隔（秒）
+  max_delay: 70
+  per_proxy_concurrency: 1  # 同一出口同时只跑一个 signup
+  per_domain_burst: 5       # 同一域名连续成功几个就换域
+  domain_cooldown: 900      # 域名被打回后的冷却（秒）
+  max_failures_per_proxy: 3
+  proxy_cooldown: 1800
+  warmup: true              # 注册后先聊一句再入池
+  session_ttl: 3000
+
+# ------------------------------------------------------------ 网关回推
+push_url: ""                # http://127.0.0.1:8787
+push_token: ""              # 网关管理口令
