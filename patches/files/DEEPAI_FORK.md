@@ -14,6 +14,7 @@ upstream release, re-apply these five files.
 | `backend/open_webui/routers/deepai.py` | new | Authenticated proxy to the DeepAI gateway: status, OAuth start/exchange, account pool, API keys, and "connect to Open WebUI" |
 | `src/lib/apis/deepai/index.ts` | new | Frontend API client |
 | `src/lib/components/admin/Settings/DeepAI.svelte` | new | The settings page (gateway, account pool, keys, models) |
+| `src/lib/components/admin/Settings/MoonAI.svelte` | new | MoonAI provider card (own pool / register / probe / export / coding-tool base URLs), mounted at the bottom of the same settings page |
 | `backend/open_webui/main.py` | +2 lines | `deepai` in the routers import list; `app.include_router(deepai.router, prefix='/api/v1/deepai', tags=['deepai'])` |
 | `src/lib/components/chat/SettingsModal.svelte` | +4 blocks | Import the page, add `admin:deepai` to the tab list and its group, render the panel |
 | `src/lib/components/admin/Settings/AdminTabIcon.svelte` | +2 lines | Icon for the new tab (`GlobeAlt`) |
@@ -71,6 +72,67 @@ All require an Open WebUI **admin** session (`get_admin_user`).
 | `POST /api/v1/deepai/register/stop` | Kill the running job (whole process tree on Windows) |
 | `GET /api/v1/deepai/register/log` | Log tail filtered by `level`, or `download=1` for a `.log` attachment |
 | `GET /api/v1/deepai/register/domains` | Domain scorecard from the worker's SQLite (30 s cache) |
+| `GET /api/v1/deepai/providers` | All providers (wavespeed / novita / moonai) with pool stats + job snapshot |
+| `GET /api/v1/deepai/providers/{id}` | One provider: endpoints, python, worker presence, pool stats |
+| `GET/POST /api/v1/deepai/providers/{id}/register` | Start / inspect that provider's bulk signup |
+| `POST /api/v1/deepai/providers/{id}/register/stop` | Stop it (whole process tree on Windows) |
+| `GET /api/v1/deepai/providers/{id}/pool` | Masked pool view (tokens report expiry only) |
+| `POST /api/v1/deepai/providers/{id}/pool/import` | Worker push / manual import (idempotent by apiKey then email) |
+| `POST /api/v1/deepai/providers/{id}/pool/{account}/health` | Report a call result (counters + cooldown) |
+| `DELETE /api/v1/deepai/providers/{id}/pool/{account}` | Remove an account |
+| `POST /api/v1/deepai/providers/{id}/pool/export` | Export `jsonl` / `csv` / `pool`, `download=1` for a file |
+| `GET /api/v1/deepai/providers/{id}/keys` | Panel key + org + token expiry, no plaintext |
+| `POST /api/v1/deepai/providers/{id}/probe` | One upstream call with a pooled token |
+| `GET /api/v1/deepai/providers/{id}/connect` | OpenAI / Anthropic base URLs for coding tools |
+
+## MoonAI card (separate provider line)
+
+`Settings → Admin → DeepAI → MoonAI 号池` is a self-contained component
+(`src/lib/components/admin/Settings/MoonAI.svelte`) mounted at the bottom of the
+same settings page. It talks to the routes above with `id=moonai`.
+
+Why a separate component rather than another block inside `DeepAI.svelte`:
+
+* MoonAI is a **different provider shape** — upstream needs an OAuth
+  `access_token` (not a panel key), has no `stream` and no `tools`, and its
+  responses are `{content, finish_reason, usage}`. The translation lives in the
+  gateway (`src/moonai-adapter.mjs`); the panel only shows state.
+* Its pool file (`data/moonai-pool.json`), schema (`dcg.pool/moonai@1`), job file
+  and lock are all `moonai`-prefixed, so the DeepAI / Allmodels / Poe pools keep
+  their own writers. Starting a MoonAI batch never touches the other three.
+* The card polls `GET /providers/moonai/register` every 3 s and stops polling
+  once the job settles, so an idle settings page costs nothing.
+
+What the card exposes: pool counters, python/worker status, the register form
+(count / concurrency / engine / fingerprint stack / mailbox source / domains /
+proxies / CDP / humanize / keys per account / export), start & stop, job progress
+with failure-reason chips and a 30-line log tail, **manual import** (one JSON per
+line or an array, optional gateway-key minting, the new key is shown once), the
+pool table (panel key preview, token expiry, gateway key prefix, engine, call
+counters, remove), pool export as a file, and the copy-paste **OpenAI Base URL**
+(`/p/moonai/v1`) and **Anthropic Base** (`/p/moonai`) for Cline / Continue /
+Claude Code.
+
+### Verifying the components without vendor/
+
+`vendor/open-webui` is not in the repo, so `npm run build` is unavailable until
+`scripts/apply-fork.ps1` restores it. Two lighter checks run here:
+
+```bash
+npm run check:svelte    # 需要 svelte@4 + svelte-preprocess@5 + typescript@5
+```
+
+* `node --test tests/moonai-fork-surface.test.mjs` — route names, client exports,
+  component mounting, block balance, "no plaintext token in the UI".
+* `node --test tests/moonai-svelte-build.test.mjs` — compiles both `.svelte`
+  files with the real compiler (skips when the toolchain is absent).
+
+One Svelte gotcha worth remembering: an attribute written as
+`placeholder='{"email":"…"}'` is parsed as an **interpolation** (`{` starts an
+expression), and fails with `Expected token }`. The card keeps such JSON in a
+script constant and passes `placeholder={importPlaceholder}`.
+
+
 
 ## Bulk signup panel
 

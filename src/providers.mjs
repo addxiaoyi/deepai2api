@@ -10,7 +10,7 @@
 //   data/<provider>-register-job.json job 状态
 //   tools/<provider>-reg/            Python worker（-m <provider>_reg）
 // 以上名字全部由 provider.id 派生，moonai 与 allmodels / poe / deepai 完全不重叠。
-import { PROVIDERS, getProvider, hasProvider, providerSummary, resolveEndpoints } from "./provider-catalog.mjs";
+import { PROVIDERS, providerSummary, resolveEndpoints } from "./provider-catalog.mjs";
 import { ProviderPool, importAccount, maskAccount } from "./provider-pool.mjs";
 import { ProviderRegistrations, DEFAULT_ANTI_BAN } from "./provider-register.mjs";
 import { createProviderRelay, probeProvider } from "./provider-relay.mjs";
@@ -24,10 +24,18 @@ export function createProviderRuntime({
   config = {},
   log = () => {},
   enabled = null,
+  endpointOverrides = null,
   onAccount = null,
 } = {}) {
   const wanted = Array.isArray(enabled) && enabled.length ? enabled.map((id) => String(id).toLowerCase()) : null;
-  const providers = PROVIDERS.filter((provider) => !wanted || wanted.includes(provider.id));
+  const overrides = endpointOverrides && typeof endpointOverrides === "object" ? endpointOverrides : {};
+  // 端点覆盖优先于 catalog 默认值（测试 / 自建反代 / 走内网时用）；
+  // 环境变量仍然是最高优先级，由 resolveEndpoints 负责。
+  const providers = PROVIDERS.filter((provider) => !wanted || wanted.includes(provider.id)).map((provider) => {
+    const override = overrides[provider.id];
+    return override && typeof override === "object" ? Object.freeze({ ...provider, ...override }) : provider;
+  });
+  const byId = new Map(providers.map((provider) => [provider.id, provider]));
 
   /** @type {Map<string, ProviderPool>} */
   const pools = new Map();
@@ -63,13 +71,13 @@ export function createProviderRuntime({
 
   const requireProvider = (id) => {
     const key = String(id ?? "").trim().toLowerCase();
-    if (!hasProvider(key) || !pools.has(key)) {
+    if (!byId.has(key) || !pools.has(key)) {
       const error = new Error(`未知 provider：${id}（可用：${[...pools.keys()].join(", ") || "无"}）`);
       error.status = 404;
       error.code = "unknown_provider";
       throw error;
     }
-    return { provider: getProvider(key), pool: pools.get(key), registrations: registrations.get(key) };
+    return { provider: byId.get(key), pool: pools.get(key), registrations: registrations.get(key) };
   };
 
   /** 一次拿到所有 provider 的概览（管理台 / CLI / /health 共用）。 */

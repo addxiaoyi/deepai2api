@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--keys-per-account", type=int, default=1)
     run.add_argument("--model", default=DEFAULT_MODEL)
     run.add_argument("--no-verify", action="store_true")
+    run.add_argument("--verify-timeout", type=float, default=180.0)
     run.add_argument("--no-probe", action="store_true")
     run.add_argument("--push-url", default="")
     run.add_argument("--push-token", default="")

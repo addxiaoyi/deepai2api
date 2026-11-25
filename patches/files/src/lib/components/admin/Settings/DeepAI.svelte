@@ -34,6 +34,10 @@
 		downloadPoeLog
 	} from '$lib/apis/deepai';
 
+	// MoonAI 是第四条独立号池线（tools/moonai-reg + /p/moonai/v1），
+	// 单独一个组件，避免把这张已经很长的页面继续撑大、也避免状态互相干扰。
+	import MoonAI from '$lib/components/admin/Settings/MoonAI.svelte';
+
 	const i18n: any = getContext('i18n');
 
 	// Kept for signature parity with the other admin panels, which all receive
@@ -1189,6 +1193,11 @@
 	{#if loading}
 		<div class="text-xs text-gray-500 dark:text-gray-400">加载中…</div>
 	{/if}
+
+	<!-- MoonAI 号池（独立 provider 线，自带注册机与反代前缀） -->
+	<div class="mt-2 border-t border-gray-100 pt-5 dark:border-gray-800">
+		<MoonAI />
+	</div>
 </div>
 
 

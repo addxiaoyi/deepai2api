@@ -464,3 +464,170 @@ async def list_models(user=Depends(get_admin_user)):
     """Model catalog straight from the gateway (price info included)."""
     state = await gw("/api/admin/state", timeout=90)
     return {"models": state.get("models") or []}
+
+
+# --------------------------------------------------------------- providers
+#
+# 通用 provider 面（网关的 /api/admin/providers/*）。目前面板只用到 moonai，
+# 但接口按 provider id 透传，加新 provider 不用改这里。
+#
+# 与上面的 DeepAI / Poe 路由互不影响：前缀是 /providers，状态在各自的号池文件里。
+
+
+class ProviderRegisterForm(BaseModel):
+    """批量注册参数；字段名对齐网关的 ProviderRegistrations.start()。"""
+
+    count: int = 2
+    concurrency: int = 2
+    engine: str = "auto"               # auto | protocol | browser | hybrid
+    browser_stack: str = "auto"        # auto | camoufox | patchright | playwright
+    mail_provider: str = "imap"        # imap | domain | mailtm | fixed
+    mail_domains: list[str] = []
+    email: str = ""
+    proxies: list[str] = []
+    cdp: str = ""
+    headful: bool = False
+    humanize: float = 0.0
+    keys_per_account: int = 1
+    export: str = ""                   # "" | jsonl | csv | pool
+    mint_keys: bool = True
+    push: bool = True
+    verify_email: bool = True
+    anti_ban: dict = {}
+
+
+class ProviderImportForm(BaseModel):
+    account: dict
+    mint_key: bool = True
+
+
+class ProviderHealthForm(BaseModel):
+    ok: bool = True
+    error: Optional[str] = None
+    cooldown_ms: int = 0
+
+
+@router.get("/providers")
+async def providers_list(user=Depends(get_admin_user)):
+    return await gw("/api/admin/providers", timeout=30)
+
+
+@router.get("/providers/{provider_id}")
+async def provider_detail(provider_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}", timeout=30)
+
+
+@router.get("/providers/{provider_id}/register")
+async def provider_register_status(provider_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/register", timeout=30)
+
+
+@router.post("/providers/{provider_id}/register")
+async def provider_register_start(
+    provider_id: str, form_data: ProviderRegisterForm, user=Depends(get_admin_user)
+):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "engine": form_data.engine,
+        "browserStack": form_data.browser_stack,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "email": form_data.email,
+        "proxies": form_data.proxies,
+        "cdp": form_data.cdp,
+        "headful": form_data.headful,
+        "humanize": form_data.humanize,
+        "keysPerAccount": form_data.keys_per_account,
+        "export": form_data.export,
+        "mintKeys": form_data.mint_keys,
+        "push": form_data.push,
+        "verifyEmail": form_data.verify_email,
+        "antiBan": form_data.anti_ban,
+    }
+    return await gw(f"/api/admin/providers/{provider_id}/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/providers/{provider_id}/register/stop")
+async def provider_register_stop(provider_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/register/stop", method="POST", timeout=30)
+
+
+@router.get("/providers/{provider_id}/pool")
+async def provider_pool(provider_id: str, limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/pool?limit={limit}", timeout=30)
+
+
+@router.post("/providers/{provider_id}/pool/import")
+async def provider_pool_import(
+    provider_id: str, form_data: ProviderImportForm, user=Depends(get_admin_user)
+):
+    return await gw(
+        f"/api/admin/providers/{provider_id}/pool/import",
+        method="POST",
+        json_body={"account": form_data.account, "mintKey": form_data.mint_key},
+        timeout=30,
+    )
+
+
+@router.post("/providers/{provider_id}/pool/{account_id}/health")
+async def provider_pool_health(
+    provider_id: str, account_id: str, form_data: ProviderHealthForm, user=Depends(get_admin_user)
+):
+    return await gw(
+        f"/api/admin/providers/{provider_id}/pool/{account_id}/health",
+        method="POST",
+        json_body={"ok": form_data.ok, "error": form_data.error, "cooldownMs": form_data.cooldown_ms},
+        timeout=30,
+    )
+
+
+@router.delete("/providers/{provider_id}/pool/{account_id}")
+async def provider_pool_delete(provider_id: str, account_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/pool/{account_id}", method="DELETE", timeout=30)
+
+
+@router.post("/providers/{provider_id}/pool/export")
+async def provider_pool_export(
+    provider_id: str, format: str = "jsonl", download: int = 0, user=Depends(get_admin_user)
+):
+    """导出账号 + 面板 Key + 网关 Key。`download=1` 直接下发文件。"""
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/providers/{provider_id}/pool/export{query}")
+        filename = f"{provider_id}-accounts.{'csv' if format == 'csv' else 'jsonl' if format == 'jsonl' else 'json'}"
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return await gw(f"/api/admin/providers/{provider_id}/pool/export{query}", method="POST", timeout=30)
+
+
+@router.get("/providers/{provider_id}/keys")
+async def provider_keys(provider_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/keys", timeout=30)
+
+
+@router.post("/providers/{provider_id}/probe")
+async def provider_probe(provider_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/providers/{provider_id}/probe", method="POST", timeout=90)
+
+
+@router.get("/providers/{provider_id}/connect")
+async def provider_connect_info(provider_id: str, user=Depends(get_admin_user)):
+    """
+    面板"接入编程工具"用的只读信息：OpenAI 兼容前缀 + 一把可用网关 Key 的前缀。
+    明文 Key 不在这里返回（只在创建/导入时一次性可见）。
+    """
+    base = await get_gateway_url()
+    keys = await gw("/api/admin/keys", timeout=30)
+    rows = keys.get("keys") if isinstance(keys, dict) else None
+    usable = [k for k in (rows or []) if not k.get("revoked")]
+    return {
+        "provider": provider_id,
+        "openai_base": f"{base}/p/{provider_id}/v1",
+        "anthropic_base": f"{base}/p/{provider_id}",
+        "key_prefix": (usable[0].get("prefix") if usable else "") or "",
+        "keys": len(usable),
+    }

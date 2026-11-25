@@ -370,6 +370,9 @@ function readPoolFile(path, providerId) {
 /**
  * 并集合并：计数取 max（用量单调），可变字段取 updatedAt 更新的那个，
  * 已发的 gatewayKey 永不丢，显式删除优先，同 email / 同 key 折叠成一条。
+ *
+ * `touchedIds` 保留在签名里只为兼容旧调用方；合并语义不再依赖它
+ * （依赖它会导致"磁盘快照较旧"时丢掉本地新账号）。
  */
 export function mergePoolAccounts(localAccounts, diskAccounts, deletedIds = new Set(), touchedIds = null) {
   const byId = new Map();
@@ -378,7 +381,11 @@ export function mergePoolAccounts(localAccounts, diskAccounts, deletedIds = new 
   for (const account of localAccounts) {
     const other = byId.get(account.id);
     if (!other) {
-      if (!touchedIds || touchedIds.has(account.id)) byId.set(account.id, account);
+      // 磁盘快照里没有这条：要么是本进程刚建的，要么磁盘那份比本地旧。
+      // 两种情况都必须保留本地条目 —— 曾经用 `touchedIds` 过滤，结果
+      // "另一次 save 先落了盘" 会把刚注册成功的账号从池里抹掉（真丢号）。
+      // 跨进程删除由 `deletedIds` 负责，不靠"不存在于磁盘"来推断删除。
+      byId.set(account.id, account);
       continue;
     }
     const newer = (account.updatedAt ?? "") >= (other.updatedAt ?? "") ? account : other;

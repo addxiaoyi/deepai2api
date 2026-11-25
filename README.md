@@ -354,18 +354,18 @@ curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
 
 ---
 
-## 3.58 三个号池的共存约定
+## 3.58 四个号池的共存约定
 
-仓库里现在同时有 DeepAI、Allmodels、Poe 三套"注册 + 号池"，它们**只共享代码，不共享状态**：
+仓库里现在同时有 DeepAI、Allmodels、Poe、MoonAI 四套"注册 + 号池"，它们**只共享代码，不共享状态**：
 
-| 边界 | DeepAI 池 | Allmodels 池 | Poe 池 |
-| --- | --- | --- | --- |
-| 池文件 | `data/gateway-state.json` | `data/allmodels-pool.json` | `data/poe-pool.json` |
-| 凭据形态 | `api_key` | dashboard key + 网关 key | `p-b` cookie |
-| 管理路由 | `/api/admin/*` | `/api/admin/allmodels/*` | `/api/poe/*` |
-| worker | `tools/deepai-reg`（`python -m deepai_reg`） | `tools/allmodels-reg` | `tools/poe-reg`（`python -m poe_reg`） |
-| 环境变量 | `DEEPAI_*` | `ALLMODELS_*` | `POE_*` |
-| 消费方 | `scheduler.mjs` → `/v1` | `provider-relay.mjs` | 外部（cookie 直接给客户端） |
+| 边界 | DeepAI 池 | Allmodels 池 | Poe 池 | MoonAI 池 |
+| --- | --- | --- | --- | --- |
+| 池文件 | `data/gateway-state.json` | `data/allmodels-pool.json` | `data/poe-pool.json` | `data/moonai-pool.json` |
+| 凭据形态 | `api_key` | dashboard key + 网关 key | `p-b` cookie | `access_token` + `api_…` + 网关 key |
+| 管理路由 | `/api/admin/*` | `/api/admin/allmodels/*` | `/api/poe/*` | `/api/admin/providers/*` |
+| worker | `tools/deepai-reg`（`python -m deepai_reg`） | `tools/allmodels-reg` | `tools/poe-reg`（`python -m poe_reg`） | `tools/moonai-reg`（`python -m moonai_reg`） |
+| 环境变量 | `DEEPAI_*` | `ALLMODELS_*` | `POE_*` | `MOONAI_*` |
+| 消费方 | `scheduler.mjs` → `/v1` | `provider-relay.mjs` | 外部（cookie 直接给客户端） | `provider-relay.mjs` → `/p/moonai/v1` |
 
 保证不打架的几处实现细节：
 
@@ -382,7 +382,7 @@ curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
 * **WebUI 一页三卡**：DeepAI 池 / 批量注册（DeepAI） / Poe 号池，各自独立轮询与按钮，
   取消或报错只影响自己那块。
 * **Python 包不互相 import 状态**：`poe_reg` 只在两处复用 `deepai_reg` 的**纯函数层**
-  （邮箱 provider、persona），不读写对方的 SQLite。
+  （邮箱 provider、persona），不读写对方的 SQLite。`moonai_reg` 自成一体（只在包内引用）。
 
 实测（合并后的工作树，同一进程）：
 
@@ -400,6 +400,135 @@ POST /api/admin/accounts        → 只写 gateway-state.json（poe 计数不变
 
 回归：`node tests/e2e.mjs` **28/28**、`node --test tests/allmodels-*.test.mjs` **22/22**、
 `python -m unittest`（deepai 26 / poe 8）全绿。
+
+---
+
+## 3.59 MoonAI 号池（注册机 + 反代出 Key）
+
+第四条独立的号池线：**mooonai.com（MoonAI）**。它的形态和前三条都不一样，所以配了
+单独的一层翻译：
+
+```
+注册机(tools/moonai-reg)               网关                                mooonai
+ 协议腿 httpx ─┐            /api/admin/providers/moonai/pool/import    auth.mooonai.com
+ 浏览器腿 ─────┴─ NDJSON ──▶ data/moonai-pool.json ─┐                    core.mooonai.com
+                                   │                │                    /api/v1/services/
+                                   │                └─ sk-dcg-… ──▶ /p/moonai/v1/*  llm-proxy
+                                   └─ 令牌续期 / 换号 / 冷却
+```
+
+| 维度 | 说明 |
+| --- | --- |
+| 调模型凭据 | **OAuth `access_token`**（不是 `api_…`，后者只给 Agent 渠道 Webhook 用） |
+| 上游协议 | 自有形状 `{content, finish_reason, usage}`，**无 choices、无 stream、无 tools** |
+| 网关做的事 | 剥字段 → 工具调用模拟 → SSE 合成 → 令牌续期 → 换号重试 |
+| 注册 | 表单 + 邮箱验证 + OAuth；**无人机校验** |
+| 模型 | `gpt-4.1` / `gpt-4o` / `gpt-4o-mini` / `gpt-5-nano` / `o3-mini` / `o4-mini` |
+
+### 三条命令
+
+```powershell
+# 1) 注册（协议腿 + 域名邮箱；被拦自动切指纹浏览器）
+node src/moonai-cli.mjs register -n 10 -c 3 --engine auto `
+  --mail-provider imap --mail-domains example.com --push
+
+# 2) 看号池 / 自检
+node src/moonai-cli.mjs pool
+node src/moonai-cli.mjs probe
+
+# 3) 打印编程工具接入配置（cline / continue / claude-code / aider / openai / node / curl）
+node src/moonai-cli.mjs config --tool cline
+```
+
+### 双引擎
+
+| `--engine` | 行为 |
+| --- | --- |
+| `protocol` | httpx 走完注册→验证→登录→OAuth→令牌→组织→Key，最快 |
+| `browser` | 真实浏览器填表、点验证链接、在页面上下文里 `fetch` 换令牌与建 Key |
+| `auto`（默认） | 先协议；遇 `blocked` / `captcha_required` / `no_token` 当场切浏览器，同一个人重跑 |
+| `hybrid` | 每个号都走浏览器（更慢更稳） |
+
+指纹内核：**Camoufox** / **Patchright** / Playwright，或 `--cdp` 直接接管
+AdsPower / BitBrowser / Morelogin 的 profile。时区与语言跟随出口（`geoAlign`）。
+
+### 邮箱
+
+`imap` / `domain`（自有域名 catch-all，**推荐**）、`mailtm`（兜底，投递不稳）、
+`fixed`。验证链接是 `auth.mooonai.com/auth/verify-email/?token=<uuid>`，
+邮件里可能被 `*.mjt.lu` 包一层 —— worker 会跟随 302 解开。
+
+### 防封
+
+域名滑动窗口限速 + 健康分（成功 +1 / 失败 −2，低于阈值停用）、同出口串行、
+账号间抖动、失败按 `kind` 退避（`rate_limited` 20–45s、`blocked` 20–40s）、
+cookie 复用、每号全新指纹。整块参数可用 `--anti-ban '<json>'` 覆盖。
+
+### 反代出 Key（编程工具直接能用的那部分）
+
+```
+GET  /p/moonai/v1/models
+POST /p/moonai/v1/chat/completions     ← Cline / Roo / Continue / Aider / OpenAI SDK
+POST /p/moonai/v1/messages             ← Claude Code（Anthropic 协议）
+```
+
+客户端用网关签的 `sk-dcg-…`，上游用号池里的 `access_token`：
+
+```bash
+curl -sS http://127.0.0.1:8787/p/moonai/v1/chat/completions \
+  -H "Authorization: Bearer sk-dcg-…" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+因为上游**不吃 `tools`**，网关把工具 schema 编进系统提示、回程解析成
+`tool_calls`（`finish_reason:"tool_calls"`，流式按 `arguments` 增量切片），
+所以依赖原生工具调用的编程客户端也能跑；上游**没有流**，SSE 由网关合成。
+
+### 管理接口
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/admin/providers` | 所有 provider 概览（含 moonai 号池统计） |
+| `GET /api/admin/providers/moonai` | 详情：端点 / python / job / 号池 |
+| `POST /api/admin/providers/moonai/register` | 起批量注册（参数同 worker） |
+| `POST /api/admin/providers/moonai/register/stop` | 停任务（Windows 整棵进程树） |
+| `GET /api/admin/providers/moonai/pool` | 号池脱敏视图（令牌只报存在与过期时间） |
+| `POST /api/admin/providers/moonai/pool/import` | worker 回推 / 手工入池（按 apiKey→email 幂等） |
+| `POST /api/admin/providers/moonai/pool/:id/health` | 回报调用结果（计数 + 冷却） |
+| `DELETE /api/admin/providers/moonai/pool/:id` | 移除账号 |
+| `POST /api/admin/providers/moonai/pool/export?format=jsonl\|csv\|pool` | 统一导出 |
+| `POST /api/admin/providers/moonai/probe` | 用号池里的令牌打一次上游 |
+
+### 与现有模块的关系（互不冲突）
+
+| 资源 | moonai | 其它三条线 |
+| --- | --- | --- |
+| 号池文件 | `data/moonai-pool.json` | `gateway-state.json` / `allmodels-pool.json` / `poe-pool.json` |
+| schema | `dcg.pool/moonai@1` | `dcg.pool/allmodels@1` 等 |
+| 注册锁 | `data/moonai-register.lock` | 每个 provider 一把，互不遮挡 |
+| job 状态 | `data/moonai-register-job.json` | 同名规则 |
+| worker | `tools/moonai-reg/moonai_reg` | `tools/<provider>-reg` |
+| 路由 | `/p/moonai/v1/*`、`/api/admin/providers/*` | `/v1/*`、`/api/admin/allmodels/*`、`/api/poe/*` |
+
+`DCG_PROVIDERS=moonai` 可只装这一条线；`config.providerEndpoints` /
+`DCG_PROVIDER_ENDPOINTS` 可把端点改到自建反代（测试也走这条）。
+
+### 测试
+
+| 用例 | 结果 |
+| --- | --- |
+| `node --test tests/moonai-pool.test.mjs`（适配层 + 号池 + 合并防丢号） | 17/17 |
+| `node --test tests/moonai-fork-surface.test.mjs`（面板接线：路由/导出/挂载/块配对） | 6/6 |
+| `node --test tests/moonai-svelte-build.test.mjs`（真实 Svelte 编译器校验两个组件） | 1/1 |
+| `node tests/moonai-e2e.mjs`（mock 上游 → 反代：流式/工具/换号/续期） | 10/10 |
+| `node tests/moonai-admin.test.mjs`（管理面 + 既有路由不冲突） | 11/11 |
+| `node tests/moonai-worker-e2e.mjs`（注册机 → 网关 → 反代出 Key，含面板按钮路径） | 11/11 |
+| `python -m unittest discover -s tools/moonai-reg/tests`（协议离线） | 6/6 |
+| `node tests/e2e.mjs`（既有网关回归） | 28/28 |
+
+一键：`npm run test:moonai`。协议取证表与字段定义见
+[`docs/MOONAI-POOL.md`](docs/MOONAI-POOL.md)，worker 用法见
+[`tools/moonai-reg/README.md`](tools/moonai-reg/README.md)。
 
 ---
 
@@ -488,8 +617,14 @@ scripts/
 tools/deepai-reg/ 批量注册机（协议引擎 + Camoufox，产物灌进 accounts[]）
 tools/allmodels-reg/ Allmodels 注册机（Better Auth + Turnstile，产物灌进号池文件）
 tools/poe-reg/     Poe 注册机（页内 GraphQL + Camoufox，独立 cookie 号池）
+tools/moonai-reg/  MoonAI 注册机（表单 + 邮箱验证 + OAuth，协议/指纹浏览器双引擎）
+src/providers.mjs        provider 运行时装配（每个 provider 一份池 + 控制器）
+src/provider-admin.mjs   `/api/admin/providers/*` 管理面
+src/moonai-adapter.mjs   MoonAI 上游形状 ⇄ OpenAI 形状（剥字段 / 工具模拟 / SSE 合成）
+src/moonai-cli.mjs       MoonAI 命令行（register / pool / export / import / probe / config）
 deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
 docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
+docs/MOONAI-POOL.md     MoonAI 号池协议 + 注册取证表 + 反代行为
 docs/ALLMODELS-MCP.md  编程工具接入（MCP / HTTP 工具桥 / 各家配置片段）
 .mcp.json              项目级 MCP 配置（Claude Code 直接发现）
 docker-compose.yml  overlay 镜像（官方 v0.13.4 + 我们的后端/前端文件）
@@ -501,7 +636,7 @@ scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 ## 7. 测试与当前状态
 
 ```
-node tests\e2e.mjs     27/27   管理台登录、伪造 state 拒绝、OAuth 交换、铸 Key、
+node tests\e2e.mjs     28/28   管理台登录、伪造 state 拒绝、OAuth 交换、铸 Key、
                               转发、Anthropic（JSON+SSE）、billing、限额、
                               粘性会话、故障切换、全灭 503、撤销、解绑
 node tests\smoke.mjs   6/6     真实上游：目录 / 非流式 / 流式 / 配额
@@ -510,6 +645,13 @@ node --test tests\allmodels-concurrency.test.mjs  14/14  多进程合并 / 删�
 node --test tests\allmodels-mcp.test.mjs    1/1   MCP 握手 + 工具调用
 node tests\allmodels-e2e.mjs                11/11  批量注册 → 入池 → 导出（含指纹浏览器、工具桥）
 python -m pytest tools\allmodels-reg\tests -q  13/13 面板注册协议 + 引擎回落
+node --test tests\moonai-pool.test.mjs      17/17  MoonAI 适配层（剥字段/工具模拟/SSE）+ 号池
+node --test tests\moonai-fork-surface.test.mjs  6/6  Open WebUI 面板接线（路由/导出/挂载）
+node --test tests\moonai-svelte-build.test.mjs  1/1  真实 Svelte 编译（需 svelte@4 + preprocess）
+node tests\moonai-e2e.mjs                   10/10  mock 上游 → 反代：流式 / 工具调用 / 换号 / 续期
+node tests\moonai-admin.test.mjs            11/11  provider 管理面 + 既有路由不冲突
+node tests\moonai-worker-e2e.mjs            11/11    注册机 → 网关入池 → 反代出 Key（流式+非流式）
+python -m unittest discover -s tools\moonai-reg\tests   6/6  MoonAI 注册协议（本地 mock）
 ```
 
 真实上游已验证：`/v1/chat/completions`（流式+非流式）、`/v1/messages`（返回标准
@@ -537,5 +679,10 @@ Anthropic message，含 `thinking` block）、`/v1/search`、`/v1/models`（28 �
 - 上游拒绝会带状态码与 `error.code`（`auth_required`、`check_in_refused`、`machine_required`、
   `theos_exhausted`、`session_busy` …），不吞消息；账号级拒绝会标记账号并切换。
 - `data/gateway-state.json` 存账号 api_key 与 Key 哈希（0600）。管理口令默认自动生成，暴露前请换强口令。
+- MoonAI 线的 `/p/moonai/v1/*` 把上游"无 choices / 无 stream / 无 tools"的接口翻译成
+  OpenAI 形状；工具调用是**提示词模拟**（不是原生 function calling），复杂多轮工具链
+  建议优先用支持原生工具的 provider。
 - 这是对本机、自己账号的通道复用；DeepAI 服务条款第 4 条限制第三方应用接入，使用范围自行评估。
+
+
 

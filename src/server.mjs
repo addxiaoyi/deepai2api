@@ -88,6 +88,17 @@ const parseAliases = (raw) => {
   }
 };
 
+/**
+ * Provider 端点覆盖：`config.providerEndpoints` 优先，其次
+ * `DCG_PROVIDER_ENDPOINTS`（形如 {"moonai":{"apiBase":"http://…"}}）。
+ * 只用于测试 / 自建反代，正常运行留空。
+ */
+const providerEndpointOverrides = (config) => {
+  const fromConfig = config?.providerEndpoints;
+  if (fromConfig && typeof fromConfig === "object") return fromConfig;
+  return parseAliases(process.env.DCG_PROVIDER_ENDPOINTS);
+};
+
 export function createGateway({ config, lane, store, scheduler, log = () => {} }) {
   const adminToken = ensureAdminToken(config, log);
   const aliases = parseAliases(process.env.DEEPAI_MODEL_ALIASES);
@@ -193,6 +204,9 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       .split(",")
       .map((id) => id.trim())
       .filter(Boolean),
+    // 端点覆盖：配置对象里显式给，或由 DCG_PROVIDER_ENDPOINTS 传 JSON。
+    // 测试与自建反代用它把上游指到本地，不污染全局环境变量。
+    endpointOverrides: providerEndpointOverrides(config),
     log: (level, message) => log(level === "warn" ? "warn" : "info", message),
   });
   const providerAdmin = createProviderAdmin({ runtime: providerRuntime, store, log });
@@ -1183,6 +1197,8 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     if (path.startsWith("/api/admin/") || path.startsWith("/api/poe/")) {
       // Provider 管理面：独立前缀，先于 allmodels / poe 的分支处理
       if (path === "/api/admin/providers" || path.startsWith("/api/admin/providers/")) {
+        // 口令或会话都行；worker 回推用的是 Bearer 管理口令，也走这条路。
+        if (!requireAdmin(req, res)) return;
         return providerAdmin.handle(req, res, path, url);
       }
       return handleAdmin(req, res, path);

@@ -123,6 +123,7 @@ class RunConfig:
     api_base: str = CORE_BASE
     keys_per_account: int = 1
     verify_email: bool = True
+    verify_timeout: float = 180.0      # 等验证邮件的上限（秒）
     model: str = DEFAULT_MODEL
     probe: bool = True                # 建完 key 后打一次 llm-proxy 验证可用
 
@@ -170,6 +171,7 @@ class RunConfig:
             api_base=str(getattr(ns, "api_base", CORE_BASE) or CORE_BASE).rstrip("/"),
             keys_per_account=max(1, int(getattr(ns, "keys_per_account", 1) or 1)),
             verify_email=not bool(getattr(ns, "no_verify", False)),
+            verify_timeout=float(getattr(ns, "verify_timeout", 180.0) or 180.0),
             model=str(getattr(ns, "model", DEFAULT_MODEL) or DEFAULT_MODEL),
             push_url=str(getattr(ns, "push_url", "") or ""),
             push_token=str(getattr(ns, "push_token", "") or ""),

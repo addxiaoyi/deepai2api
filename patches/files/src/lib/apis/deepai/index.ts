@@ -170,3 +170,128 @@ export const downloadPoeLog = async (token: string = '', level: string = '') => 
 	if (!res.ok) throw new Error('导出失败');
 	return res.blob();
 };
+
+// ------------------------------------------------------------------ providers
+//
+// 通用 provider 面（目前面板只接 moonai）。网关侧号池文件是
+// data/<provider>-pool.json，与 DeepAI / Allmodels / Poe 的池完全隔离。
+
+export type ProviderRegisterOptions = {
+	count: number;
+	concurrency: number;
+	engine: 'auto' | 'protocol' | 'browser' | 'hybrid';
+	browserStack: 'auto' | 'camoufox' | 'patchright' | 'playwright';
+	mailProvider: 'imap' | 'domain' | 'mailtm' | 'fixed';
+	mailDomains: string[];
+	email?: string;
+	proxies: string[];
+	cdp?: string;
+	headful: boolean;
+	humanize: number;
+	keysPerAccount: number;
+	export?: '' | 'jsonl' | 'csv' | 'pool';
+	mintKeys: boolean;
+	push: boolean;
+	verifyEmail: boolean;
+	antiBan?: Record<string, unknown>;
+};
+
+export const listProviders = async (token: string = '') => request(token, '/providers');
+
+export const getProvider = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}`);
+
+export const getProviderRegister = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}/register`);
+
+export const startProviderRegister = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	options: ProviderRegisterOptions
+) =>
+	request(token, `/providers/${providerId}/register`, {
+		method: 'POST',
+		body: JSON.stringify({
+			count: options.count,
+			concurrency: options.concurrency,
+			engine: options.engine,
+			browser_stack: options.browserStack,
+			mail_provider: options.mailProvider,
+			mail_domains: options.mailDomains,
+			email: options.email ?? '',
+			proxies: options.proxies,
+			cdp: options.cdp ?? '',
+			headful: options.headful,
+			humanize: options.humanize,
+			keys_per_account: options.keysPerAccount,
+			export: options.export ?? '',
+			mint_keys: options.mintKeys,
+			push: options.push,
+			verify_email: options.verifyEmail,
+			anti_ban: options.antiBan ?? {}
+		})
+	});
+
+export const stopProviderRegister = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}/register/stop`, { method: 'POST' });
+
+export const getProviderPool = async (token: string = '', providerId: string = 'moonai', limit = 200) =>
+	request(token, `/providers/${providerId}/pool?limit=${limit}`);
+
+export const importProviderAccount = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	account: Record<string, unknown>,
+	mintKey = true
+) =>
+	request(token, `/providers/${providerId}/pool/import`, {
+		method: 'POST',
+		body: JSON.stringify({ account, mint_key: mintKey })
+	});
+
+export const reportProviderHealth = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	accountId: string,
+	ok: boolean,
+	error: string | null = null,
+	cooldownMs = 0
+) =>
+	request(token, `/providers/${providerId}/pool/${accountId}/health`, {
+		method: 'POST',
+		body: JSON.stringify({ ok, error, cooldown_ms: cooldownMs })
+	});
+
+export const deleteProviderAccount = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	accountId: string
+) => request(token, `/providers/${providerId}/pool/${accountId}`, { method: 'DELETE' });
+
+export const probeProvider = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}/probe`, { method: 'POST' });
+
+export const getProviderKeys = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}/keys`);
+
+export const getProviderConnectInfo = async (token: string = '', providerId: string = 'moonai') =>
+	request(token, `/providers/${providerId}/connect`);
+
+export const exportProviderPool = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => request(token, `/providers/${providerId}/pool/export?format=${format}`, { method: 'POST' });
+
+export const downloadProviderPool = async (
+	token: string = '',
+	providerId: string = 'moonai',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/providers/${providerId}/pool/export?format=${format}&download=1`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};

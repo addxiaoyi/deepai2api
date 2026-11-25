@@ -195,6 +195,21 @@ class Runner:
                 reason=str(cause)[:300],
             )
             raise
+        except Exception as cause:  # noqa: BLE001 - 第三方库的裸异常也要归类，不能吞
+            kind = "transport"
+            self.store.record_domain(domain, ok=False)
+            self.anti_ban.record_domain(domain, ok=False)
+            self.anti_ban.record_proxy(proxy, ok=False)
+            self.store.record_failure(email=email, kind=kind, reason=f"{type(cause).__name__}: {cause}", domain=domain, engine=config.engine)
+            self.report.log(f"异常（按 {kind} 处理）：{type(cause).__name__}: {cause}", "warn")
+            self.report.event(
+                type="failed",
+                index=index,
+                email=email,
+                kind=kind,
+                reason=f"{type(cause).__name__}: {cause}"[:300],
+            )
+            raise MoonAIError(str(cause), kind=kind) from cause
         finally:
             if mailbox is not None:
                 try:
@@ -208,7 +223,7 @@ class Runner:
         try:
             if self.config.verify_email and mailbox is not None:
                 self.report.log("等验证邮件…")
-                verify_link = mailbox.wait_for_verify_link(timeout=180)
+                verify_link = mailbox.wait_for_verify_link(timeout=self.config.verify_timeout)
                 self.report.log(f"验证链接：{verify_link[:60]}…")
             return engine.run(
                 email=email,
@@ -225,7 +240,7 @@ class Runner:
         verify_link = ""
         if self.config.verify_email and mailbox is not None:
             self.report.log("等验证邮件（浏览器腿）…")
-            verify_link = mailbox.wait_for_verify_link(timeout=180)
+            verify_link = mailbox.wait_for_verify_link(timeout=self.config.verify_timeout)
         return run_browser_registration(
             config=self.config,
             persona=persona,

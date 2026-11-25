@@ -405,6 +405,11 @@ export class ProviderRegistrations {
       JSON.stringify(antiBan),
       "--key-policy",
       JSON.stringify(keyPolicy),
+      // worker 的 sqlite/jsonl 落在网关数据目录下（data/<provider>-reg/），
+      // 不放 tools/<provider>-reg/out：一是跟号池状态同源好备份，
+      // 二是避免不同 dataDir 的两套网关共用同一份去重库。
+      "--out-dir",
+      join(this.dataDir, `${this.id}-reg`),
     ];
     if (cdp) args.push("--cdp", cdp);
     if (headful) args.push("--headful");
