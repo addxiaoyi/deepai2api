@@ -341,20 +341,23 @@ WaveSpeed 官方发布了 **WaveSpeed Desktop**（Windows / macOS / Linux）与 
 桌面端只需要用户"粘 API key"，说明它**不携带账号体系** —— 逆向它的价值不是注册，
 而是把官方客户端当成**协议文档**：恢复真实端点、header 契约、轮询策略。
 
-分析器：`tools/wavespeed-reg/wavespeed_reg/re.py`（纯静态，不执行样本、不联网）
+分析器：`tools/wavespeed-reg/wavespeed_reg/scanner.py`（纯静态，不执行样本、不联网）
+
+> 模块名从 `re` 改成了 `scanner`：叫 `re` 会和标准库撞名，一旦这个包目录进了
+> `sys.path` 就会遮蔽标准库，所有 `import re` 全盘失败（实测踩过）。
 
 ```bash
 cd tools/wavespeed-reg
 
 # 自动在 Downloads / Desktop / TEMP 里找安装包
-python -m wavespeed_reg.re --detect
+python -m wavespeed_reg.scanner --detect
 
 # 指定安装包或已解包目录
-python -m wavespeed_reg.re --path "C:/Downloads/WaveSpeed-Setup.exe"
-python -m wavespeed_reg.re --path ./app.asar.unpacked --out ./out/re
+python -m wavespeed_reg.scanner --path "C:/Downloads/WaveSpeed-Setup.exe"
+python -m wavespeed_reg.scanner --path ./app.asar.unpacked --out ./out/re
 
 # 只要端点清单
-python -m wavespeed_reg.re --path ./app.apk --only endpoints
+python -m wavespeed_reg.scanner --path ./app.apk --only endpoints
 ```
 
 支持三类输入：
@@ -420,6 +423,116 @@ npm run test:providers
 
 ---
 
+---
+
+## 13. 指纹浏览器：camoufox 的三个坑（实测）
+
+camoufox 是我们指纹质量最高的一层（Firefox 内核 + C++ 层指纹改写）。但它的参数
+**不校验**——传错不会报"参数不存在"，而是要么直接 TypeError，要么让指纹生成器无解。
+更麻烦的是 `engine=auto` 会把失败**静默降级**到 playwright，于是"看起来一直在跑，
+其实一直用的是兜底内核"。
+
+以下三条是本机实测（camoufox **0.5.9**）确认的，已固化在
+`tools/*/.../camoufox_options.py` 与回归测试里。
+
+### 坑 1：`timezone` 不是合法参数
+
+```python
+Camoufox(timezone="America/New_York")
+# TypeError: BrowserType.launch() got an unexpected keyword argument 'timezone'
+```
+
+**启动直接失败**，不是忽略。时区只能靠 `geoip=<IP>` 让 camoufox 自己推导。
+
+### 坑 2：`os` 传列表会让指纹生成器无解
+
+```python
+Camoufox(os=["windows", "macos"])
+# InvalidConstraints: ... yielded no possible values for "os"
+```
+
+文档写着"可以传列表随机选"，但 0.5.9 实测不行。**每次只传单个 OS**
+（`os="windows"` 或 `os=["windows"]` 都可以），由我们的 `fingerprint_for()` 决定，
+这样指纹与 UA 才自洽。
+
+### 坑 3：`screen` 必须容得下 `window`
+
+```python
+Camoufox(screen=Screen(min_width=1280, min_height=720, ...), window=(1366, 768))
+# InvalidConstraints（window 高 768 > screen 下限 720）
+```
+
+按平台给可行区间（`camoufox_options.SCREEN_BOUNDS`），window 与区间下限对齐。
+
+### 另外两条"不是坑但选错了会坏事"
+
+| 参数 | 默认 | 原因 |
+| --- | --- | --- |
+| `geoip` | 传**代理出口 IP** | `geoip=True` 会让 camoufox 检测**本机** IP，与代理不一致时比不设更糟；传域名会 `InvalidIP` 硬报错 |
+| `fingerprint_preset` | **不传** | `True` 会随机抽一个**捆绑预设**；多账号批量跑必然重复 → 指纹聚类。不传则 fpgen 每次生成唯一指纹（实测两次启动 screen 不同） |
+| `pin_cpu_cores` | **开启** | 关掉时 camoufox 报**宿主**核数（本机 32 核，普通桌面机很显眼）。代价是真实 CPU 开销 + 并发启动串行化 |
+
+### 时区到底听谁的
+
+实测：`geoip=8.8.8.8` → `America/Los_Angeles`（GeoIP 库的定位），
+而不是我们 persona 里按国家码猜的 `America/New_York`。
+
+**IP 定位比国家码猜得准**，所以正确顺序是：
+
+1. 有出口 IP → `geoip=<IP>` 主导时区/经纬度/国家/locale；
+2. 没有出口 IP（无代理，或域名 DNS 解析失败）→ 只有宿主时区可用，
+   日志会明确写 *"时区无法跟随出口（期望 X）"*，**不假装成功**。
+
+域名形式的代理会被本地解析成 IP（`socket.gethostbyname`）；解析不到就不传 `geoip`。
+
+### 可调项
+
+```yaml
+browser:
+  stack: auto            # auto | camoufox | patchright | playwright
+  pin_cpu_cores: true    # 核数跟随指纹（默认开）
+  use_preset: false      # 用捆绑预设（批量场景别开）
+  canvas_noise: null     # null = 由 camoufox 按身份/宿主差异决定
+  geoip: true            # 让时区/经纬度跟随出口
+```
+
+命令行也支持嵌套覆盖：
+
+```bash
+node src/provider-cli.mjs register --provider novita -n 3 \
+  --anti-ban '{"ip_concurrency":1}'
+```
+
+```python
+Config.load(None, {"browser": {"pin_cpu_cores": False, "canvas_noise": False}})
+```
+
+### 真实启动验证
+
+```bash
+cd tools/wavespeed-reg && python -c "
+import sys; sys.path.insert(0,'.')
+from wavespeed_reg.browser import FingerprintBrowser
+with FingerprintBrowser(stack='camoufox', log=print) as b:
+    b.page.goto('about:blank')
+    print(b.stack, b.page.evaluate('Intl.DateTimeFormat().resolvedOptions().timeZone'))
+"
+```
+
+修复前后对照（同一段代码）：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| 结果 | `camoufox 启动失败（TypeError: unexpected keyword argument 'timezone'）` → 静默降级到 playwright | `camoufox os=windows geoip=8.8.8.8（时区跟随出口）[pin_cpu]` |
+| 时区 | 宿主 | 出口 IP 所在时区 |
+| 核数 | 宿主 32 | 指纹声称值（8/12/24） |
+
+回归测试（`test_camoufox_*`，共 8 项）：参数白名单对照 camoufox 真实签名、
+禁止 `timezone`、`os` 必须单值、`window` 必须落在 `screen` 内、`geoip` 绝不返回 `True`、
+`fingerprint_preset` 必须 opt-in、`pin_cpu_cores` 默认开。
+
+---
+
 ## 12. 已知限制
 
 - **WaveSpeed 的 OAuth 是硬门槛**：没有可用登录态就无法建号。这是站点事实，不是实现缺陷。
@@ -429,3 +542,24 @@ npm run test:providers
 - **Turnstile**：两家都需要 token（WaveSpeed 未公开 sitekey，运行时从页面挖）。
   `--captcha auto` 先不带 token 试，被拒再按配置解题。
 - **生成类 POST 不重试**：这是刻意的，重复提交会产生重复计费任务。
+
+---
+
+## 14. 另册：不属于 provider 运行时的两条线
+
+`providerRuntime`（`/p/<provider>/v1/*`）只装配 `src/provider-catalog.mjs` 里登记的
+provider。另外两条线形态不同，各自独立成册，但都遵守同一套约定（一份号池文件、
+一份 job 状态、一个路由前缀、一套 `sk-dcg-` Key）：
+
+| 线 | 号池 | 路由 | 文档 |
+| --- | --- | --- | --- |
+| Poe | `data/poe-pool.json` | `/api/poe/*` | — |
+| **Clever AI Hub** | `data/cleverai-pool.json` | `/cleverai/v1/*`、`/api/admin/cleverai/*` | [`CLEVERAI-POOL.md`](CLEVERAI-POOL.md) |
+
+Clever AI 为什么不能塞进 provider 运行时：它没有面板 api key，凭据是 Firebase
+`refreshToken` + 一枚会过期的 **App Check JWT**（要浏览器换），上游又是自有 `omni`
+信封而不是 OpenAI 形状。所以它自带 `src/cleverai-relay.mjs` 与
+`tools/cleverai-reg`，用 `dcg.pool/cleverai@1` 落盘。
+
+一句话差异：provider 运行时假设"上游说 OpenAI"，cleverai 这层假设"上游说 omni SSE，
+工具调用是 `tool_call` 内容项"，翻译方向相反。

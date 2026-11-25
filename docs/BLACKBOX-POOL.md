@@ -115,6 +115,32 @@ Google 登录页的交互（identifier → password → 设备验证 → 同意�
 稳定实现，且强风控下必被拦。所以 worker 把"人"的部分交给浏览器腿，把"领 Key"
 的部分留给协议腿——两者产出的号池记录同形，`engine` 字段标明来源。
 
+### 浏览器腿：为什么默认 Camoufox
+
+<https://camoufox.com/>（Firefox + **C++ 层**指纹改写，不是 JS 注入）。选它的理由：
+
+| 点 | 说明 |
+| --- | --- |
+| 不是 Chromium | 反爬厂商大量按 "Chromium vs 真 Chrome" 区分；Firefox 系更少被针对性打 |
+| Juggler < CDP | Playwright 的 Firefox 通道比 CDP 更底层，JS 侧泄漏更少 |
+| 指纹自洽 | 由 BrowserForge 按真实流量分布生成设备/屏幕/WebGL/字体，不会出现"Windows UA + Apple GPU" |
+| geoip | `geoip=True` 直接按出口 IP 定经度纬度/时区/locale，比我们手拍时区靠谱 |
+| humanize | 自带人类化鼠标轨迹；`disable_coop=True` 才能点 cross-origin iframe 里的 Turnstile |
+
+因此 worker 的 camoufox 分支有两条硬约束（都写进了单测）：
+
+1. **绝不注入 Chrome UA / sec-ch-ua**——Camoufox 是 Firefox，注进去等于自曝；
+2. **`geoip` 与 `locale` 不同时给**——时区/语言必须由出口 IP 决定。
+
+安装与内核：
+
+```bash
+python -m pip install "camoufox[geoip]"
+camoufox fetch          # pip 包不含内核；GitHub 限流时先 export GITHUB_TOKEN=…
+```
+
+`python -m blackbox_reg doctor` 会分别报告 pip 包与内核两件事。
+
 ### 面板 Key 的获取（`protocol` 腿）
 
 面板没有公开的 Key 接口文档，所以 worker 做**候选路径探测**：

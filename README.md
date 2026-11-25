@@ -19,6 +19,35 @@ OAuth 登录订阅账号 → 铸造 OpenAI 兼容 API Key → 给任意工具用
 
 ---
 
+## 0. 闭环总览（先读这个）
+
+仓库现在有 **六条上游线**，它们共用同一个五环闭环：
+
+```
+① 注册 ──▶ ② 入池 ──▶ ③ 出 Key ──▶ ④ 反代 ──▶ ⑤ 观测/回收
+worker        <line>-pool.json    sk-dcg-…      /<line>/v1/*    /health · state · 导出
+```
+
+| 线 | 号池 schema | worker | 反代前缀 | 文档 |
+| --- | --- | --- | --- | --- |
+| DeepAI Code | `gateway-state.json` | `tools/deepai-reg` | `/v1/*` | 本文 §3 |
+| Allmodels | `dcg.pool/allmodels@1` | `tools/allmodels-reg` | 无（工具层/MCP） | [ALLMODELS-POOL](docs/ALLMODELS-POOL.md) |
+| Poe | `dcg.pool/poe@1` | `tools/poe-reg` | 无（仅注册+池） | [POE-POOL](docs/POE-POOL.md) |
+| Provider 运行时（wavespeed/novita/moonai/zo/blackbox） | `dcg.pool/<id>@1` | `tools/<id>-reg` | `/p/<id>/v1/*` | [PROVIDERS](docs/PROVIDERS.md) · [ZO](docs/ZO-POOL.md) |
+| Clever AI Hub | `dcg.pool/cleverai@1` | `tools/cleverai-reg` | `/cleverai/v1/*` | [CLEVERAI-POOL](docs/CLEVERAI-POOL.md) |
+| Gab AI | `dcg.pool/gabai@1` | `tools/gabai-reg` | `/gab/v1/*` | [GABAI-POOL](docs/GABAI-POOL.md) |
+
+一条命令查闭环有没有断：
+
+```powershell
+npm run loop      # node scripts/check-loop.mjs：文件 / 路由 / schema 逐条点，有缺口 exit 1
+```
+
+哪条线为什么少一环（Allmodels/Poe 没有反代是设计决定）、已知未完成项、以及
+"新增一条线要动哪 7 个文件"，都在 **[docs/LOOP.md](docs/LOOP.md)**。
+
+---
+
 ## 1. 快速开始
 
 ```powershell
@@ -330,7 +359,18 @@ WebUI 同一页下面新增「Poe 号池（独立）」卡片：注册（数量/
 
 ---
 
-## 3.57 Linux 一键部署
+## 3.57 部署（三种形态）
+
+完整的部署手册在 **[docs/DEPLOY.md](docs/DEPLOY.md)**：环境变量矩阵（按线）、各线依赖、
+Nginx 反代（SSE 必须 `proxy_buffering off`）、备份/升级/回滚、排障表。
+
+| 场景 | 做法 |
+| --- | --- |
+| 本机试用 | `npm install && node src/index.mjs`（面板另跑 `apply-fork.ps1` + `docker compose up -d`） |
+| Linux + 面板 | `docker compose up -d --build` |
+| Linux 无人值守 | `sudo bash deploy/install.sh --with-docker` |
+
+Linux 一键部署：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/addxiaoyi/deepai2api/main/deploy/install.sh | sudo bash
@@ -344,13 +384,21 @@ curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
 | --- | --- |
 | 网关 | `/opt/deepai2api`，`systemctl status deepai-gateway`（默认 0.0.0.0:8787） |
 | WebUI | `docker compose up` 的 fork，`systemctl status deepai-webui`（:3000） |
-| 口令/环境 | `/etc/deepai2api/env`（0600，首次安装自动生成管理口令） |
-| 数据 | `/var/lib/deepai2api/data`（`gateway-state.json`、`register-job.json`） |
-| 注册 worker | `/opt/deepai2api/.venv/bin/python` + `tools/deepai-reg` |
+| 口令/环境 | `/etc/deepai2api/env`（0600，首次安装自动生成管理口令；六个 worker 的 `_PYTHON`/`_REGISTER_DIR` 都在这里） |
+| 数据 | `/var/lib/deepai2api/data`（`gateway-state.json`、六个 `*-pool.json`、各自 job 状态） |
+| 注册 worker | `/opt/deepai2api/.venv/bin/python` + `tools/<line>-reg`（安装时逐个装依赖，单线失败只 warn） |
 
 脚本是幂等的：`--source .` 从当前目录装、`--dir/--port/--user` 可改、
 `--rotate-token` 换口令、`--with-camoufox` 顺带拉 1.3 GB 的浏览器内核；
 没有 systemd 或非 root 会直接报错退出。文件在 [`deploy/`](deploy/install.sh)。
+
+一键验收（部署完先跑这个）：
+
+```bash
+npm run loop            # 六条线闭环有没有断
+curl -s localhost:8787/health | jq '.cleverai, .gabai'
+npm run test:all        # 静态 + 接口 + 197 项 worker 测试 + 既有回归
+```
 
 ---
 
@@ -600,6 +648,7 @@ AdsPower / BitBrowser / Morelogin 的 profile；时区语言跟随出口（`geoi
 ```
 GET  /cleverai/v1/models
 POST /cleverai/v1/chat/completions     ← Cline / Roo / Continue / OpenAI SDK
+POST /cleverai/v1/messages             ← Claude Code（Anthropic 协议）
 GET  /cleverai/v1/usage
 ```
 
@@ -607,12 +656,24 @@ GET  /cleverai/v1/usage
 curl -sS http://127.0.0.1:8787/cleverai/v1/chat/completions \
   -H "Authorization: Bearer sk-dcg-…" -H "Content-Type: application/json" \
   -d '{"model":"cleverai/default","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# Claude Code：把 base url 指到 /cleverai 即可（Anthropic 面走同一号池）
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cleverai
+export ANTHROPIC_AUTH_TOKEN=sk-dcg-…
+claude -p "list the files in this repo"
 ```
 
 **工具调用**：上游的 `options.tools[]` 与 `tool_call`/`tool_result` 内容项与 OpenAI 的
 `tools[]` / `tool_calls` / `role:"tool"` 双向翻译，`finish_reason` 正确落到
 `tool_calls`，流式按 `arguments` 增量切片 —— 所以依赖原生 function calling 的编程客户端
 可以直接用。失败按 `APP_CHECK` / 401 / 429 / `no credit` 分级冷却并换号。
+
+> **实测结论（2026-11）**：这条线的注册、鉴权、计费、SSE、工具管线都是真的，
+> 但**模型正文是上游的占位实现** —— 每个 engine 只回品牌套话（OpenAI 系
+> "Please update to the latest version"，Anthropic/Gemini 系 "heavy traffic"），
+> 换平台/换 engine/补 settings/consent/`options` 字段都不变。转发层照常工作，但会打标：
+> 非流式响应头 `X-Cleverai-Notice`、流式首帧 `: cleverai-notice=<code>`、号池统计
+> `placeholderReplies`。完整取证表见 [`docs/CLEVERAI-POOL.md`](docs/CLEVERAI-POOL.md)。
 
 ### 管理接口
 
@@ -646,8 +707,8 @@ curl -sS http://127.0.0.1:8787/cleverai/v1/chat/completions \
 
 | 用例 | 结果 |
 | --- | --- |
-| `node --test tests/cleverai-pool.test.mjs`（号池协议 + 工具翻译 + SSE 工具帧） | 14/14 |
-| `node --test tests/cleverai-routes.test.mjs`（管理面 + 反代面 + 不冲突） | 8/8 |
+| `node --test tests/cleverai-pool.test.mjs`（号池协议 + 工具翻译 + SSE 工具帧 + 占位回答标记 + 成本表） | 18/18 |
+| `node --test tests/cleverai-routes.test.mjs`（管理面 + OpenAI/Anthropic 反代面 + 面板 state + 不冲突） | 10/10 |
 | `python -m pytest tools/cleverai-reg/tests -q`（协议离线，MockTransport） | 20/20 |
 
 协议取证与字段定义见 [`docs/CLEVERAI-POOL.md`](docs/CLEVERAI-POOL.md)，worker 用法见
@@ -762,6 +823,44 @@ python -m blackbox_reg cli-env `
 
 ---
 
+## 3.61 Gab AI 号池（注册机 + 直通反代）
+
+第六条独立的号池线：**gab.ai**。形态最省事 —— 上游本身就同时说 OpenAI 与 Anthropic，
+所以反代只做「换 Authorization + 轮询 + 故障切换」，没有形状翻译。
+
+```
+注册(tools/gabai-reg) ──▶ /api/admin/gabai/pool/import ──▶ data/gabai-pool.json
+                                    │                              │
+                                    └ mintApiKey ─▶ gab.ai/json/api-keys
+                                                                   │
+下游 sk-dcg-… ──▶ /gab/v1/* ──▶ GabaiProxy ──▶ gab.ai/v1/*  ◀──────┘
+```
+
+| 维度 | 说明 |
+| --- | --- |
+| 凭据 | 面板签发的 `gab_…` key（账号密码只用于**补建** key） |
+| 反代 | `/gab/v1/chat/completions`、`/completions`、`/responses`、`/messages`、`/models` |
+| 直通语义 | 请求体原样转发，只覆盖 `authorization`；响应（含 SSE）原样搬回，头里补 `x-gab-account` |
+| 故障切换 | 只在响应头发出之前发生，流式不会被截断；`X-Session-Affinity` 可粘账号 |
+| 套餐门槛 | 上游回 `403 plus_required` 时标 `plusBlocked`，换号但不判为坏号 |
+| 冷却 | 401/403 → 10 min，429 → 45 s，其余可重试状态 → 10 min |
+
+```powershell
+# 注册（协议腿 + 域名邮箱，产物直接入池并发 sk-dcg- Key）
+Invoke-RestMethod -Method Post http://127.0.0.1:8787/api/admin/gabai/register `
+  -Headers @{Authorization="Bearer $env:DEEPAI_GATEWAY_TOKEN"} -ContentType application/json `
+  -Body '{"count":5,"concurrency":2,"mailProvider":"imap","mailDomains":["example.com"]}'
+
+# 看号池 / 给某个账号补一把 gab_ key / 导出
+Invoke-RestMethod http://127.0.0.1:8787/api/admin/gabai/pool -Headers @{Authorization="Bearer $env:DEEPAI_GATEWAY_TOKEN"}
+Invoke-RestMethod -Method Post "http://127.0.0.1:8787/api/admin/gabai/pool/<id>/mint" -Headers @{...}
+Invoke-RestMethod -Method Post "http://127.0.0.1:8787/api/admin/gabai/pool/export?format=csv&download=1" -OutFile gabai.csv -Headers @{...}
+```
+
+细节（字段、路由表、失败分类）见 [`docs/GABAI-POOL.md`](docs/GABAI-POOL.md)。
+
+---
+
 ## 4. OpenWebUI 二次开发（fork）
 
 `vendor/open-webui` = **Open WebUI 0.13.4 上游 + DeepAI provider**。
@@ -849,6 +948,7 @@ tools/allmodels-reg/ Allmodels 注册机（Better Auth + Turnstile，产物灌�
 tools/poe-reg/     Poe 注册机（页内 GraphQL + Camoufox，独立 cookie 号池）
 tools/moonai-reg/  MoonAI 注册机（表单 + 邮箱验证 + OAuth，协议/指纹浏览器双引擎）
 tools/cleverai-reg/ Clever AI Hub 注册机（Firebase + App Check，协议/指纹浏览器双引擎）
+tools/gabai-reg/   Gab AI 注册机（gab.ai 表单 + 建 key）
 tools/blackbox-reg/ Blackbox AI 注册机（Google OAuth：会话/授权码协议腿 + 指纹浏览器腿）
 src/providers.mjs        provider 运行时装配（每个 provider 一份池 + 控制器）
 src/provider-admin.mjs   `/api/admin/providers/*` 管理面
@@ -858,10 +958,19 @@ src/cleverai-pool.mjs    Clever AI 号池：落盘格式、去重、钱包、冷
 src/cleverai-register.mjs 批量注册控制器（起 python worker、流式事件、入池）
 src/cleverai-relay.mjs   omni 信封 + SSE ⇄ OpenAI（含 tools / tool_calls 双向翻译、App Check 续期）
 src/cleverai-cli.mjs     Clever AI 命令行（register / pool / export / import / keys / chat）
+src/gabai-pool.mjs       Gab AI 号池：落盘格式、去重、plusBlocked、冷却、导出
+src/gabai-register.mjs   Gab AI 批量注册控制器
+src/gabai-proxy.mjs      Gab AI 直通反代 + mintApiKey（网页反代出 apikey）
 deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
+docs/LOOP.md           闭环总览：五环定义、六条线矩阵、缺口决策、新增线 checklist
 docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
 docs/MOONAI-POOL.md     MoonAI 号池协议 + 注册取证表 + 反代行为
 docs/CLEVERAI-POOL.md   Clever AI 号池协议 + App Check 取证 + 反代/工具翻译
+docs/GABAI-POOL.md      Gab AI 号池协议 + 反代直通 + mint key
+docs/POE-POOL.md        Poe 号池协议（为什么没有反代面）
+docs/ZO-POOL.md         Zo 号池协议 + 魔法链注册 + /zo/ask 翻译
+scripts/check-loop.mjs  闭环自检（npm run loop）
+docs/DEPLOY.md         部署手册（三种形态 / 环境变量矩阵 / Nginx / 备份回滚 / 排障）
 docs/BLACKBOX-POOL.md   Blackbox 号池协议 + Auth.js/Google OAuth 取证 + 防封与反代
 docs/BLACKBOX-CLI-RE.md Blackbox CLI 逆向记录 + 运行环境模拟（指向本网关）
 docs/ALLMODELS-MCP.md  编程工具接入（MCP / HTTP 工具桥 / 各家配置片段）
@@ -875,6 +984,11 @@ scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 ## 7. 测试与当前状态
 
 ```
+npm run loop            6 条线   闭环自检：五环 + schema + 路由 + 文档 + 测试（有缺口 exit 1）
+npm run test:loop      35/35   cleverai 18 + cleverai-routes 10 + gabai 7
+npm run test:fork      12/12   WebUI 面板接线（Pools + MoonAI：路由/导出/挂载/块配对）
+npm run test:workers  197/197  10 个 Python worker 的离线协议/配置/号池测试
+npm run test:all       全绿    loop + test:loop + test:workers + e2e + providers（一条命令验完）
 node tests\e2e.mjs     28/28   管理台登录、伪造 state 拒绝、OAuth 交换、铸 Key、
                               转发、Anthropic（JSON+SSE）、billing、限额、
                               粘性会话、故障切换、全灭 503、撤销、解绑
@@ -891,8 +1005,12 @@ node tests\moonai-e2e.mjs                   10/10  mock 上游 → 反代：流�
 node tests\moonai-admin.test.mjs            11/11  provider 管理面 + 既有路由不冲突
 node tests\moonai-worker-e2e.mjs            11/11    注册机 → 网关入池 → 反代出 Key（流式+非流式）
 python -m unittest discover -s tools\moonai-reg\tests   6/6  MoonAI 注册协议（本地 mock）
-node --test tests\cleverai-pool.test.mjs    14/14  Clever AI 号池协议 + omni↔OpenAI 工具翻译 + SSE 工具帧
+node --test tests\cleverai-pool.test.mjs    18/18  Clever AI 号池协议 + omni↔OpenAI 工具翻译 + 占位回答标记
+node --test tests\gabai-routes.test.mjs     7/7     Gab 管理面 + 入池幂等 + 导出 + 反代鉴权边界
+node scripts\check-loop.mjs                 6 条线  闭环自检：五环 + schema + 路由 + 文档 + 测试
 python -m pytest tools\cleverai-reg\tests -q   20/20 Clever AI 注册协议 + App Check（MockTransport）
+python -m pytest tools\gabai-reg\tests -q      9/9   Gab 注册/登录/建 key/Plus 门槛（MockTransport）
+python -m pytest tools\zo-reg\tests -q        26/26 Zo 身份/配置/号池/限速/错误分类
 python -m unittest discover -s tools\blackbox-reg\tests   12/12 Blackbox Auth.js 协议 + Key 探测 + TOTP
 node --test tests\blackbox-provider.test.mjs  6/6   Blackbox 描述符 / 号池隔离 / 运行时挂载
 node tests\blackbox-e2e.mjs                   8/8   mock 站点 → worker → 号池 → 反代（含 SSE 与 tool_calls）
@@ -914,6 +1032,8 @@ Anthropic message，含 `thinking` block）、`/v1/search`、`/v1/models`（28 �
 | 设置页看不到 | fork 没还原：先跑 `.\scripts\apply-fork.ps1`，再 `docker compose up -d --build` |
 | 模型列表为空 | 网关没连账号；DeepAI 设置页先 OAuth 登录，再点「接入并启用模型」 |
 | 429 `rate_limit` | 该 Key 触发了 rpm/日限额；管理台改限额或换 Key |
+| cleverai 回 "please update" / "heavy traffic" | 上游占位回答，不是你的配置错；看响应头 `X-Cleverai-Notice` 与 `docs/CLEVERAI-POOL.md` 的取证表 |
+| cleverai 401 `APP_CHECK_REQUIRED` | App Check 令牌过期或没取到：`POST /api/admin/cleverai/appcheck`（会开一次浏览器），再重试 |
 
 ---
 

@@ -55,6 +55,24 @@ data: {"finishReason":"stop","delta":{"content":[]},"sequenceNumber":2}
 }
 ```
 
+### 上游行为取证（2026-11，全部线上复现）
+
+| 结论 | 证据 |
+| --- | --- |
+| App Check 是硬门 | 缺 `X-Firebase-AppCheck` 时 `/users`、`/omni/response` 回 `401 {"code":"APP_CHECK_REQUIRED"}`；补齐后同一请求 201/200 |
+| 令牌可复用 | `exchangeRecaptchaEnterpriseToken` → `{"token":…,"ttl":"3600s"}`；同一枚令牌给不同 uid 用，全部通过 |
+| 版本头是软坑 | 不带 `Version`/`X-Version` 时 HTTP 200，但正文是一条 "please update" 的假回答 |
+| 注册即有额度 | `POST /users` → 201，`wallet.totalCredit=75`（30 每日 + 45 欢迎），另送 1 张 `PROMOTIONAL_CREDIT` 券 |
+| engine 目录 | `GET /configs?type=engines` → `data.engines` 94 条，含 `cost` / `userAuth` / `userSubscriptions`（新号也是 `["FREE","PRO_TRIAL","PRO"]`） |
+| **模型层是占位实现** | 每个 engine 都返回品牌定制的套话：OpenAI 系 "Please update to the latest version"，Anthropic/Gemini 系 "experiencing heavy traffic"，流首固定 "**Clever AI** is _analyzing_ your request…"，`finishReason` 落 `stop`/`error`。换 `X-Platform`（web/android/ios/desktop）、换 engine、换 `filters:"auto"`、建 `user-settings`、打 legal-consent、补齐 `options.wr/bidAt/udAt` 均不变 |
+
+最后一条决定了这一条线的定位：**注册、鉴权、计费、SSE、工具调用管线都是真的，唯独模型正文是占位文本**（项目本身是 `genius-ai-app-test-1` 这个 test 工程）。所以转发层照常工作，但会把命中占位文本的回答标出来，不让下游把它当成模型答案：
+
+- 非流式：响应头 `X-Cleverai-Notice: update_required | heavy_traffic | analyzing`，正文里同时有 `x_cleverai_notice`
+- 流式：先发一帧 SSE 注释 `: cleverai-notice=<code>`（客户端会忽略，日志/抓包里能看到）
+- 计数：账号条目上的 `notices{}`，号池统计里的 `placeholderReplies`
+- 设 `CLEVERAI_ACCEPT_PLACEHOLDER=1` 可当作普通文本透传（默认也会透传正文，只是打标）
+
 | 字段 | 说明 |
 | --- | --- |
 | `schema` | 固定 `dcg.pool/cleverai@1`，消费方应校验 |
@@ -85,6 +103,7 @@ data: {"finishReason":"stop","delta":{"content":[]},"sequenceNumber":2}
   "updatedAt": "2026-11-26T01:50:04.000Z",
   "requests": 0,
   "failures": 0,
+  "notices": { "total": 0, "byCode": {}, "lastAt": null },
   "healthy": true,
   "cooldownUntil": 0,
   "lastError": null,
@@ -108,6 +127,8 @@ data: {"finishReason":"stop","delta":{"content":[]},"sequenceNumber":2}
 - `wallet` 上游每轮会回传新的额度快照，`recordWallet()` 合并进条目。
 - `status`：`active` | `revoked` | `disabled`。
 - 健康字段由调用结果驱动，`pick()` 只挑 `status=active && healthy && cooldownUntil<=now`。
+- `notices` 记上游占位回答的命中次数（按 code 分桶），不触发冷却 —— 换号也一样，
+  不是账号的问题。
 - `engine`：`protocol`（纯 HTTP）| `browser`（指纹浏览器里跑完注册）。
 
 ## 4. 写入口径（谁写、怎么写）
@@ -145,6 +166,7 @@ GET  /health                                 # cleverai.accounts / healthy / key
 ```
 GET  /cleverai/v1/models
 POST /cleverai/v1/chat/completions     # OpenAI 形状，支持 stream 与 tools
+POST /cleverai/v1/messages             # Anthropic 形状（Claude Code 等）
 GET  /cleverai/v1/usage
 ```
 
@@ -152,9 +174,14 @@ GET  /cleverai/v1/usage
   轮询决定，`X-Session-Affinity` 可粘住某个账号）。
 - `tools` / `tool_calls` 双向翻译：OpenAI 的 `tools[]` → `options.tools[]`，
   上游 `tool_call` 内容项 → `choices[].delta.tool_calls`，`role:"tool"` → `tool_result`。
-  所以 Cline / Continue / Roo / Claude Code（走 Anthropic 兼容层）能直接当 OpenAI 端点用。
+  所以 Cline / Continue / Roo 这类工具能直接把它当 OpenAI 端点用。
+- `/cleverai/v1/messages` 复用 `src/anthropic.mjs`：`messagesToChat` 进、
+  `chatToMessage` / `streamAsAnthropic` 出，Anthropic 的 `tool_use` / `tool_result`
+  与上游的 `tool_call` / `tool_result` 对应，`stop_reason` 落 `tool_use`。
+  Claude Code 只要把 `ANTHROPIC_BASE_URL` 指到 `http://127.0.0.1:8787/cleverai` 即可。
 - 失败策略：401 且带 `APP_CHECK` → 强刷令牌重试一次；401 其它 → 清 `idToken` 冷却
   30 s；429 → 冷却 5 min；`no credit` → 冷却 30 min；其余 60 s。冷却中的账号不参与轮询。
+- 上游返回占位文本时会打标（`X-Cleverai-Notice` / `: cleverai-notice=` 注释帧）。
 
 ## 7. 批量注册 / 并发语义
 

@@ -138,12 +138,17 @@ log "installing gateway dependencies (npm ci)"
 log "creating python venv for the signup workers"
 python3 -m venv "$INSTALL_DIR/.venv"
 "$INSTALL_DIR/.venv/bin/pip" install --quiet --upgrade pip
-"$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$INSTALL_DIR/tools/deepai-reg/requirements.txt" || {
-  warn "camoufox wheel install failed; the protocol engine still works"
-}
-if [ -f "$INSTALL_DIR/tools/poe-reg/requirements.txt" ]; then
-  "$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$INSTALL_DIR/tools/poe-reg/requirements.txt" || true
-fi
+# 每个 worker 的 requirements 都可能不同（有的带 camoufox，有的只要 httpx）。
+# 逐个装、失败只 warn：一条线的依赖装不上不该拦住整个安装。
+for worker in deepai-reg poe-reg allmodels-reg cleverai-reg gabai-reg zo-reg novita-reg wavespeed-reg blackbox-reg moonai-reg; do
+  req="$INSTALL_DIR/tools/$worker/requirements.txt"
+  [ -f "$req" ] || continue
+  if "$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$req"; then
+    log "  $worker: ok"
+  else
+    warn "  $worker: 依赖安装失败（该线只能跑协议腿或不可用）"
+  fi
+done
 if [ "$WITH_CAMOUFOX" = 1 ]; then
   log "fetching the Camoufox browser (~1.3 GB)"
   "$INSTALL_DIR/.venv/bin/python" -m camoufox fetch || warn "camoufox fetch failed — browser engine unavailable"
@@ -164,6 +169,12 @@ DEEPAI_PYTHON=${INSTALL_DIR}/.venv/bin/python
 DEEPAI_REGISTER_DIR=${INSTALL_DIR}/tools/deepai-reg
 POE_PYTHON=${INSTALL_DIR}/.venv/bin/python
 POE_REGISTER_DIR=${INSTALL_DIR}/tools/poe-reg
+ALLMODELS_PYTHON=${INSTALL_DIR}/.venv/bin/python
+ALLMODELS_REGISTER_DIR=${INSTALL_DIR}/tools/allmodels-reg
+CLEVERAI_PYTHON=${INSTALL_DIR}/.venv/bin/python
+CLEVERAI_REGISTER_DIR=${INSTALL_DIR}/tools/cleverai-reg
+GABAI_PYTHON=${INSTALL_DIR}/.venv/bin/python
+GABAI_REGISTER_DIR=${INSTALL_DIR}/tools/gabai-reg
 EOF
   chmod 600 "$ENV_FILE"
 else
