@@ -58,3 +58,8 @@ __pycache__/
 # 内含明文 API key 的抓包脚本：脱敏后再入库
 probe/cleverai/
 
+
+# 一次性探针脚本（逆向时随手写的，别入库）
+tmp_*.py
+tmp_*.mjs
+tmp-mcp-*.jsonl
