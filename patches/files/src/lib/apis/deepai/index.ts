@@ -295,3 +295,140 @@ export const downloadProviderPool = async (
 	if (!res.ok) throw new Error('导出失败');
 	return res.blob();
 };
+/* ------------------------------------------------- 号池总览 + 两条新线 */
+
+export const getPoolsOverview = async (token: string = '') => request(token, '/pools');
+
+export type CleveraiRegisterOptions = {
+	count: number;
+	concurrency: number;
+	engine: 'auto' | 'protocol' | 'browser';
+	browser_stack: 'auto' | 'camoufox' | 'patchright' | 'playwright';
+	mail_provider: 'imap' | 'fixed' | 'mailtm' | 'tempmail_lol';
+	mail_domains: string[];
+	appcheck: 'browser' | 'capsolver' | 'manual';
+	captcha_key?: string | null;
+	appcheck_token?: string | null;
+	chat_engine?: string | null;
+	proxies: string[];
+	headful: boolean;
+	humanize: number;
+	verify_email: boolean;
+	warmup: boolean;
+	export?: 'jsonl' | 'csv' | 'pool' | null;
+};
+
+export const getCleveraiStatus = async (token: string = '') =>
+	request(token, '/cleverai/status');
+
+export const startCleveraiRegister = async (
+	token: string = '',
+	options: CleveraiRegisterOptions
+) => request(token, '/cleverai/register', { method: 'POST', body: JSON.stringify(options) });
+
+export const stopCleveraiRegister = async (token: string = '') =>
+	request(token, '/cleverai/register/stop', { method: 'POST' });
+
+export const getCleveraiPool = async (token: string = '', limit: number = 200) =>
+	request(token, `/cleverai/pool?limit=${limit}`);
+
+export const importCleveraiAccount = async (
+	token: string = '',
+	account: Record<string, unknown>,
+	mintKey: boolean = true
+) =>
+	request(token, '/cleverai/pool/import', {
+		method: 'POST',
+		body: JSON.stringify({ account, mint_key: mintKey })
+	});
+
+export const deleteCleveraiAccount = async (token: string = '', accountId: string) =>
+	request(token, `/cleverai/pool/${accountId}`, { method: 'DELETE' });
+
+export const refreshCleveraiAppCheck = async (token: string = '') =>
+	request(token, '/cleverai/appcheck', { method: 'POST' });
+
+export const getCleveraiConnectInfo = async (token: string = '') =>
+	request(token, '/cleverai/connect');
+
+export const exportCleveraiPool = async (
+	token: string = '',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => request(token, `/cleverai/pool/export?format=${format}`, { method: 'POST' });
+
+export const downloadCleveraiPool = async (
+	token: string = '',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/cleverai/pool/export?format=${format}&download=1`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+export type GabaiRegisterOptions = {
+	count: number;
+	concurrency: number;
+	engine: 'auto' | 'protocol' | 'browser';
+	browser_stack: 'auto' | 'camoufox' | 'patchright' | 'playwright';
+	mail_provider: 'imap' | 'fixed' | 'mailtm' | 'tempmail_lol';
+	mail_domains: string[];
+	email?: string | null;
+	captcha: 'none' | 'capsolver' | 'manual';
+	captcha_key?: string | null;
+	proxies: string[];
+	headful: boolean;
+	humanize: number;
+	verify_email: boolean;
+	create_api_key: boolean;
+	export?: 'jsonl' | 'csv' | 'pool' | null;
+};
+
+export const getGabaiStatus = async (token: string = '') => request(token, '/gabai/status');
+
+export const startGabaiRegister = async (token: string = '', options: GabaiRegisterOptions) =>
+	request(token, '/gabai/register', { method: 'POST', body: JSON.stringify(options) });
+
+export const stopGabaiRegister = async (token: string = '') =>
+	request(token, '/gabai/register/stop', { method: 'POST' });
+
+export const getGabaiPool = async (token: string = '', limit: number = 200) =>
+	request(token, `/gabai/pool?limit=${limit}`);
+
+export const importGabaiAccount = async (
+	token: string = '',
+	account: Record<string, unknown>,
+	mintKey: boolean = true
+) =>
+	request(token, '/gabai/pool/import', {
+		method: 'POST',
+		body: JSON.stringify({ account, mint_key: mintKey })
+	});
+
+export const mintGabaiKey = async (token: string = '', accountId: string) =>
+	request(token, `/gabai/pool/${accountId}/mint`, { method: 'POST' });
+
+export const deleteGabaiAccount = async (token: string = '', accountId: string) =>
+	request(token, `/gabai/pool/${accountId}`, { method: 'DELETE' });
+
+export const getGabaiConnectInfo = async (token: string = '') =>
+	request(token, '/gabai/connect');
+
+export const exportGabaiPool = async (
+	token: string = '',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => request(token, `/gabai/pool/export?format=${format}`, { method: 'POST' });
+
+export const downloadGabaiPool = async (
+	token: string = '',
+	format: 'jsonl' | 'csv' | 'pool' = 'jsonl'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/gabai/pool/export?format=${format}&download=1`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};

@@ -360,7 +360,7 @@ def test_re_analyzer_extracts_endpoints_from_asar() -> None:
     import tempfile
     from pathlib import Path
 
-    from wavespeed_reg import re as wsre
+    from wavespeed_reg import scanner as wsre
 
     with tempfile.TemporaryDirectory() as tmp:
         asar = Path(tmp) / "app.asar"
@@ -402,7 +402,7 @@ def test_re_analyzer_handles_apk_zip() -> None:
     import zipfile
     from pathlib import Path
 
-    from wavespeed_reg import re as wsre
+    from wavespeed_reg import scanner as wsre
 
     with tempfile.TemporaryDirectory() as tmp:
         apk = Path(tmp) / "app.apk"
@@ -420,11 +420,122 @@ def test_re_analyzer_handles_apk_zip() -> None:
 
 
 def test_re_analyzer_reports_missing_path() -> None:
-    from wavespeed_reg import re as wsre
+    from wavespeed_reg import scanner as wsre
 
     report = wsre.analyze("definitely/not/here.bin", out_dir="out/re-test")
     assert report.errors, "不存在的路径应报错而不是静默成功"
     assert not report.findings
+
+
+# --------------------------------------------- 10. camoufox 启动参数（防回归）
+
+# 这一组测试的由来：camoufox 0.5.9 实测暴露出三个会**让启动直接失败**的坑，
+# 而失败会被 auto 降级静默掩盖（看起来"能跑"，其实一直用的是 playwright 腿）。
+#   1. `timezone=` 不是合法参数 -> TypeError: unexpected keyword argument
+#   2. `os=[多元素]` -> InvalidConstraints: no possible values for "os"
+#   3. `screen` 容纳不下 `window` -> 同样 InvalidConstraints
+# 所以这里直接对着 camoufox 的真实签名做白名单校验。
+
+
+def test_camoufox_options_are_legal() -> None:
+    from wavespeed_reg.camoufox_options import camoufox_launch_options, camoufox_legal_keys
+
+    legal = camoufox_legal_keys()
+    if not legal:
+        return  # camoufox 未安装：校验不了，当成通过（不让离线测试依赖可选包）
+
+    options = camoufox_launch_options(
+        fingerprint={"platform": "Windows", "locale": "en-US", "timezone": "America/New_York"},
+        proxy="http://user:pass@1.1.1.1:8080",
+        headless=True,
+    )
+    illegal = set(options) - legal
+    assert not illegal, f"构造出了 camoufox 不认的参数：{sorted(illegal)}（合法：{sorted(legal)}）"
+
+
+def test_camoufox_never_passes_timezone() -> None:
+    """`timezone` 会让 camoufox 启动直接 TypeError —— 必须永远不传。"""
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    options = camoufox_launch_options(
+        fingerprint={"platform": "Windows", "locale": "en-US", "timezone": "Asia/Tokyo"},
+        proxy="http://1.1.1.1:8080",
+    )
+    assert "timezone" not in options, "timezone 是非法参数，只能靠 geoip 推导"
+
+
+def test_camoufox_os_is_single_value() -> None:
+    """`os` 传列表会让 fpgen 在 os 维度无解。"""
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    for platform in ("Windows", "MacOS", "Linux", "darwin", "weird-unknown"):
+        options = camoufox_launch_options(fingerprint={"platform": platform})
+        assert isinstance(options["os"], str), f"{platform}: os 必须是单值字符串，实际 {options['os']!r}"
+        assert options["os"] in ("windows", "macos", "linux"), options["os"]
+
+
+def test_camoufox_window_fits_screen() -> None:
+    """window 尺寸必须落在 screen 约束内，否则 fpgen 无解。"""
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    for platform in ("Windows", "MacOS", "Linux"):
+        options = camoufox_launch_options(fingerprint={"platform": platform})
+        screen = options.get("screen")
+        window = options.get("window")
+        if screen is None or window is None:
+            continue
+        assert screen.min_width <= window[0] <= screen.max_width, f"{platform}: window 宽度越界"
+        assert screen.min_height <= window[1] <= screen.max_height, f"{platform}: window 高度越界"
+
+
+def test_geoip_never_returns_true() -> None:
+    """`geoip=True` 会让 camoufox 检测**本机** IP，与代理不一致时比不设更糟。"""
+    from wavespeed_reg.camoufox_options import geoip_target
+
+    assert geoip_target("") == "", "没有代理时不该给 geoip"
+    assert geoip_target("http://1.2.3.4:8080") == "1.2.3.4", "IP 形式应原样使用"
+    assert geoip_target("http://user:pw@1.2.3.4:8080") == "1.2.3.4", "应剥掉凭据与端口"
+    # 域名解析失败时返回空串，绝不返回 True
+    assert geoip_target("http://definitely-not-a-real-host.invalid:8080") == ""
+
+
+def test_geoip_propagates_to_options() -> None:
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    with_proxy = camoufox_launch_options(
+        fingerprint={"platform": "Windows"}, proxy="http://1.1.1.1:8080", geo_align=True
+    )
+    assert with_proxy.get("geoip") == "1.1.1.1", "有代理 IP 时 geoip 应指向出口"
+
+    without = camoufox_launch_options(fingerprint={"platform": "Windows"}, proxy="", geo_align=True)
+    assert "geoip" not in without, "没有出口 IP 时不该传 geoip"
+
+    off = camoufox_launch_options(
+        fingerprint={"platform": "Windows"}, proxy="http://1.1.1.1:8080", geo_align=False
+    )
+    assert "geoip" not in off, "geo_align=False 时不该传 geoip"
+
+
+def test_fingerprint_preset_is_opt_in() -> None:
+    """捆绑预设会被多账号抽到同一个 —— 默认不启用，保证每账号唯一指纹。"""
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    default = camoufox_launch_options(fingerprint={"platform": "Windows"})
+    assert "fingerprint_preset" not in default, "默认应让 fpgen 生成唯一指纹"
+
+    preset = camoufox_launch_options(fingerprint={"platform": "Windows"}, use_preset=True)
+    assert preset.get("fingerprint_preset") is True
+
+
+def test_pin_cpu_cores_default_on() -> None:
+    """不开 pin_cpu_cores 时 camoufox 会报宿主核数（本机 32 核，很显眼）。"""
+    from wavespeed_reg.camoufox_options import camoufox_launch_options
+
+    assert camoufox_launch_options(fingerprint={"platform": "Windows"}).get("pin_cpu_cores") is True
+    assert (
+        camoufox_launch_options(fingerprint={"platform": "Windows"}, pin_cpu_cores=False).get("pin_cpu_cores")
+        is False
+    )
 
 
 # ------------------------------------------------------------------- runner

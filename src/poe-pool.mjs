@@ -8,7 +8,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const EMPTY = { version: 1, accounts: [] };
+export const POOL_SCHEMA = "dcg.pool/poe@1";
+const EMPTY = { schema: POOL_SCHEMA, version: 1, accounts: [] };
 
 export const POE_STATUSES = ["email_verified", "phone_required", "active", "dead"];
 
@@ -131,7 +132,8 @@ function load(path) {
     if (!existsSync(path)) return structuredClone(EMPTY);
     const parsed = JSON.parse(readFileSync(path, "utf8"));
     if (!parsed || !Array.isArray(parsed.accounts)) return structuredClone(EMPTY);
-    return parsed;
+    // 老文件没有 schema：读的时候补上，写回时落盘。
+    return { schema: POOL_SCHEMA, ...parsed };
   } catch {
     return structuredClone(EMPTY);
   }

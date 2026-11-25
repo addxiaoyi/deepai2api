@@ -407,6 +407,69 @@ def test_key_policy_defaults() -> None:
     assert policy.open_model_access is False
 
 
+# ---------------------------------------------11. camoufox 启动参数（防回归）
+
+# 来自 camoufox 0.5.9 的实测结论：timezone 非法（启动 TypeError）、
+# os 传列表会让 fpgen 无解、screen 必须容纳 window、geoip 只接受 IP。
+# 这些坑会被 engine=auto 的降级静默掩盖，所以必须用测试钉住。
+
+
+def test_camoufox_options_are_legal() -> None:
+    from novita_reg.camoufox_options import camoufox_launch_options, camoufox_legal_keys
+
+    legal = camoufox_legal_keys()
+    if not legal:
+        return  # camoufox 未安装
+    options = camoufox_launch_options(
+        fingerprint={"platform": "Windows", "locale": "en-US", "timezone": "America/New_York"},
+        proxy="http://user:pass@8.8.8.8:8080",
+    )
+    assert not (set(options) - legal), f"非法参数：{sorted(set(options) - legal)}"
+
+
+def test_camoufox_never_passes_timezone() -> None:
+    from novita_reg.camoufox_options import camoufox_launch_options
+
+    options = camoufox_launch_options(
+        fingerprint={"platform": "MacOS", "locale": "ja-JP", "timezone": "Asia/Tokyo"},
+        proxy="http://1.1.1.1:8080",
+    )
+    assert "timezone" not in options
+
+
+def test_camoufox_os_is_single_value_and_window_fits() -> None:
+    from novita_reg.camoufox_options import camoufox_launch_options
+
+    for platform in ("Windows", "MacOS", "Linux"):
+        options = camoufox_launch_options(fingerprint={"platform": platform})
+        assert isinstance(options["os"], str), f"{platform}: os 必须是单值"
+        screen, window = options.get("screen"), options.get("window")
+        if screen and window:
+            assert screen.min_width <= window[0] <= screen.max_width
+            assert screen.min_height <= window[1] <= screen.max_height
+
+
+def test_geoip_only_accepts_ip() -> None:
+    """`geoip=True` 会拿本机 IP（与代理不一致更糟）；域名会 InvalidIP 硬报错。"""
+    from novita_reg.camoufox_options import camoufox_launch_options, geoip_target
+
+    assert geoip_target("") == ""
+    assert geoip_target("http://1.2.3.4:8080") == "1.2.3.4"
+    assert geoip_target("http://nope.invalid:8080") == ""
+    options = camoufox_launch_options(fingerprint={"platform": "Windows"}, proxy="http://1.1.1.1:8080")
+    assert options.get("geoip") == "1.1.1.1"
+
+
+def test_novita_isolation_still_intact() -> None:
+    """camoufox 参数修复不能破坏 novita 的多账号隔离。"""
+    from novita_reg.antiban import profile_isolation_plan
+
+    a = profile_isolation_plan("a@x.com", root="p", seed=1)
+    b = profile_isolation_plan("b@x.com", root="p", seed=2)
+    assert a["profile_dir"] != b["profile_dir"]
+    assert a["noise_seed"] != b["noise_seed"]
+
+
 def main() -> int:
     tests = [
         (name, obj)

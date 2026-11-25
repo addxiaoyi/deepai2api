@@ -560,6 +560,9 @@ class Runner:
                 signup_wait=self.cfg.browser.signup_wait,
                 verify_wait=self.cfg.browser.verify_wait,
                 keygen_wait=self.cfg.browser.keygen_wait,
+                pin_cpu_cores=self.cfg.browser.pin_cpu_cores,
+                use_preset=self.cfg.browser.use_preset,
+                canvas_noise=self.cfg.browser.canvas_noise,
                 log=lambda message: self.log(message, level="debug"),
             ) as browser:
                 account = browser.signup_flow(

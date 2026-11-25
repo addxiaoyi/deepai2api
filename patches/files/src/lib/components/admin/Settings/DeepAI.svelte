@@ -37,6 +37,8 @@
 	// MoonAI 是第四条独立号池线（tools/moonai-reg + /p/moonai/v1），
 	// 单独一个组件，避免把这张已经很长的页面继续撑大、也避免状态互相干扰。
 	import MoonAI from '$lib/components/admin/Settings/MoonAI.svelte';
+	// 六条线的号池总览 + Clever AI Hub / Gab AI 两张卡，挂在本页最底部
+	import Pools from '$lib/components/admin/Settings/Pools.svelte';
 
 	const i18n: any = getContext('i18n');
 
@@ -1197,6 +1199,9 @@
 	<!-- MoonAI 号池（独立 provider 线，自带注册机与反代前缀） -->
 	<div class="mt-2 border-t border-gray-100 pt-5 dark:border-gray-800">
 		<MoonAI />
+
+<!-- 六条线号池总览 + Clever AI Hub / Gab AI（独立号池与注册机） -->
+<Pools />
 	</div>
 </div>
 

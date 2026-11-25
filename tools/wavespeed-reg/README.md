@@ -192,7 +192,53 @@ with WaveSpeed() as ws:
 2. **body 里的 `code` 可能与 HTTP 200 不一致** —— 必须解析 body；
 3. **轮询地址由服务端下发**（`data.urls.get`），不要硬编码拼接。
 
-## 7. 测试
+## 7. 指纹浏览器：camoufox 的实测约束
+
+camoufox 是三层内核里指纹质量最高的一层，但它的参数**不做校验**——传错要么直接
+TypeError，要么让指纹生成器无解。而 `engine=auto` 会静默降级到 playwright，于是
+"一直在跑但一直用的是兜底内核"这种问题很难发现。
+
+本机实测（camoufox **0.5.9**）确认三条硬约束，已固化在 `camoufox_options.py`
+与 `tests/test_offline.py::test_camoufox_*`：
+
+| 约束 | 错误写法 | 症状 |
+| --- | --- | --- |
+| `timezone` 不是合法参数 | `Camoufox(timezone="America/New_York")` | `TypeError: unexpected keyword argument 'timezone'`，启动失败 |
+| `os` 不能传多元素列表 | `Camoufox(os=["windows","macos"])` | `InvalidConstraints: no possible values for "os"` |
+| `screen` 必须容得下 `window` | `Screen(min_height=720)` + `window=(1366,768)` | `InvalidConstraints` |
+
+时区只能靠 `geoip=<IP>` 推导；`geoip=True` 会检测**本机** IP（与代理不一致更糟），
+传域名会 `InvalidIP`。所以 `geoip_target()` 会把代理 host 变成 IP（本地 DNS 解析），
+解析不到就不传 —— 此时日志会明确写"时区无法跟随出口"，不假装成功。
+
+两个默认选择：
+
+- `fingerprint_preset` **不传**：`True` 会随机抽捆绑预设，批量跑必然重复 → 指纹聚类。
+- `pin_cpu_cores` **开启**：不开发布的是**宿主**核数（本机 32，很显眼）。
+
+```yaml
+browser:
+  pin_cpu_cores: true    # 核数跟随指纹（默认开）
+  use_preset: false      # 捆绑预设（批量别开）
+  canvas_noise: null     # null = 由 camoufox 决定
+  geoip: true            # 时区/经纬度跟随出口
+```
+
+验证真的能启动（不要只信 auto 降级的结果）：
+
+```bash
+python -c "
+import sys; sys.path.insert(0,'.')
+from wavespeed_reg.browser import FingerprintBrowser
+with FingerprintBrowser(stack='camoufox', log=print) as b:
+    b.page.goto('about:blank')
+    print(b.stack, b.page.evaluate('Intl.DateTimeFormat().resolvedOptions().timeZone'))
+"
+# 期望：camoufox <时区>
+```
+
+
+## 8. 测试
 
 ```bash
 cd tools/wavespeed-reg
@@ -204,7 +250,7 @@ python -m pytest tests/ -q
 覆盖：错误分类映射、退避表、域名速率窗与健康分、异步任务 poll 与终态、
 POST 不重试、OAuth-only 语义、key 校验、指纹自洽性、出口 IP 串行化。
 
-## 8. 限制
+## 9. 限制
 
 - **OAuth 是硬门槛**：没有 Google/GitHub 的可用登录态就无法建号。这不是实现缺陷，
   是站点事实。

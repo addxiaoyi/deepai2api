@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from .camoufox_options import camoufox_launch_options, describe_launch
 from .errors import (
     Blocked,
     CaptchaRequired,
@@ -133,6 +134,9 @@ class FingerprintBrowser:
         signup_wait: float = 90.0,
         verify_wait: float = 180.0,
         keygen_wait: float = 60.0,
+        pin_cpu_cores: bool = True,
+        use_preset: bool = False,
+        canvas_noise: bool | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.panel = panel.rstrip("/")
@@ -154,6 +158,9 @@ class FingerprintBrowser:
         self.signup_wait = signup_wait
         self.verify_wait = verify_wait
         self.keygen_wait = keygen_wait
+        self.pin_cpu_cores = pin_cpu_cores
+        self.use_preset = use_preset
+        self.canvas_noise = canvas_noise
         self.log = log or (lambda _m: None)
         self.rng = random.Random()
         self._pw = None
@@ -211,33 +218,31 @@ class FingerprintBrowser:
     def _try_camoufox(self) -> bool:
         try:
             from camoufox.sync_api import Camoufox
-            from camoufox.fingerprints import Screen
         except Exception as exc:  # noqa: BLE001 - 可选依赖
             self.log(f"camoufox 不可用（{exc.__class__.__name__}），换下一个内核")
             return False
-        fp = self.fingerprint
-        launch: dict[str, Any] = {
-            "headless": self.headless,
-            "humanize": 2.2 * max(0.2, self.humanize),
-            "os": ["windows", "macos"],
-            "locale": [fp.get("locale") or self.locale],
-            "block_webrtc": True,
-            "fingerprint_preset": True,
-            "screen": Screen(min_width=1280, min_height=720, max_width=1920, max_height=1080),
-            "window": (1366, 768),
-            "pin_cpu_cores": True,
-            "enable_cache": True,
-            "geoip": bool(self.geoip and self.proxy),
-            "i_know_what_im_doing": True,
-        }
-        if fp.get("timezone"):
-            launch["timezone"] = fp["timezone"]
-        elif self.timezone_id:
-            launch["timezone"] = self.timezone_id
-        if self.proxy:
-            launch["proxy"] = _proxy_dict(self.proxy)
+
+        # 参数构造与校验集中在 camoufox_options.py —— 那里记录了三条实测硬约束：
+        # timezone 非法（启动直接 TypeError）、os 不能传列表（fpgen 无解）、
+        # screen 必须容纳 window。
+        options = camoufox_launch_options(
+            fingerprint=self.fingerprint,
+            proxy=self.proxy,
+            headless=self.headless,
+            humanize=self.humanize,
+            locale=self.locale,
+            geo_align=self.geoip,
+            pin_cpu_cores=self.pin_cpu_cores,
+            use_preset=self.use_preset,
+            canvas_noise=self.canvas_noise,
+        )
+        if self.fingerprint.get("timezone") and "geoip" not in options:
+            self.log(
+                f"时区无法跟随出口（期望 {self.fingerprint['timezone']}）："
+                "camoufox 只接受 geoip=<IP>，没有可用出口 IP 时只能用宿主时区"
+            )
         try:
-            self._camoufox = Camoufox(**launch)
+            self._camoufox = Camoufox(**options)
             self._browser = self._camoufox.__enter__()
         except Exception as exc:  # noqa: BLE001 - 二进制没下 / 启动失败
             self.log(f"camoufox 启动失败（{exc}），换下一个内核")
@@ -246,7 +251,7 @@ class FingerprintBrowser:
         self._context = contexts[0] if contexts else self._browser.new_context()
         self.page = self._context.new_page()
         self.stack = "camoufox"
-        self.log("指纹内核：camoufox（Firefox + 指纹预设）")
+        self.log(f"指纹内核：{describe_launch(options)}")
         return True
 
     def _try_playwright(self, flavour: str) -> bool:
@@ -723,3 +728,4 @@ def available_stacks() -> dict[str, str]:
     for module in ("camoufox", "patchright", "playwright"):
         out[module] = "ok" if importlib.util.find_spec(module) else "missing"
     return out
+

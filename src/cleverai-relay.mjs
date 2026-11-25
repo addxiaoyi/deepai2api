@@ -31,6 +31,28 @@ const API_BASE = "https://api.cleverai.app/appserver/api/v1";
 // 上游的代币计价按 engine 走；未知模型按最便宜的一档算，避免直接吃 no_credit。
 export const DEFAULT_MODEL_COST = 2;
 
+// 从 `GET /configs?type=engines` 抄下来的常见档位（2026-11 实测）。
+const ENGINE_COSTS = {
+  "openai-gpt-6-luna": 2,
+  "openai-gpt-5-6-luna": 5,
+  "openai-gpt-5-6-terra-instant": 5,
+  "openai-gpt-6-1-terra": 8,
+  "antropic-calude-sonnet-5-5": 10,
+  "google-gemini-3-8-flash": 10,
+  "xai-grok-4-7": 10,
+  "openai-gpt-6-sol": 15,
+  "openai-gpt-6-1-sol": 15,
+  "openai-gpt-6-2-sol": 15,
+  "meta-muse-wonder-1-0": 20,
+  "antropic-calude-opus-5-5": 20,
+  "google-gemini-4-neon": 23,
+  "google-gemini-4-argon": 30,
+  "openai-gpt-5-6-sol": 30,
+  "antropic-calude-fable-5-2": 40,
+  "openai-gpt-6-2-astra": 60,
+  "openai-gpt-6-astra": 75,
+};
+
 const MODEL_ALIASES = {
   // 下游习惯的名字 → 上游 engineId。没命中的原样透传。
   "gpt-4o": "openai-gpt-6-luna",
@@ -48,6 +70,29 @@ export const resolveEngine = (model) => {
   if (!raw) return "openai-gpt-6-luna";
   return MODEL_ALIASES[raw] ?? MODEL_ALIASES[raw.toLowerCase()] ?? raw.replace(/^cleverai\//, "");
 };
+
+/**
+ * 上游的"占位回答"识别。
+ *
+ * 实测（见 docs/CLEVERAI-POOL.md 的取证表）：这些 engine 的模型层对普通账号
+ * 只会回一句按品牌定制的套话，不是真正的模型输出 —— OpenAI 系回 "please update"，
+ * Anthropic/Gemini 系回 "heavy traffic"，而且流前都带 "**Clever AI** is analyzing"。
+ * 反代仍然照常转发，但要把它标出来，别让下游把套话当成模型答案。
+ */
+const PLACEHOLDER_PATTERNS = [
+  { code: "update_required", re: /please update to the latest version/i },
+  { code: "heavy_traffic", re: /experiencing heavy traffic/i },
+  { code: "analyzing", re: /clever ai\s*[^\n]{0,4}\s*is\s+_?analyzing_?\s+your request/i },
+];
+
+export function detectPlaceholder(text) {
+  const blob = String(text ?? "");
+  if (!blob.trim()) return "";
+  for (const { code, re } of PLACEHOLDER_PATTERNS) {
+    if (re.test(blob)) return code;
+  }
+  return "";
+}
 
 const now = () => Date.now();
 
@@ -323,6 +368,21 @@ export class CleveraiRelay {
     };
   }
 
+  /** 一轮对话的 credit 成本：按 engine 查表，未知按最便宜一档。 */
+  costFor(engine) {
+    const id = String(engine ?? "").replace(/^cleverai\//, "");
+    return ENGINE_COSTS[id] ?? DEFAULT_MODEL_COST;
+  }
+
+  /**
+   * 账号套餐。上游按这个字段校验权限，发错反而被拒；没有订阅记录就是 FREE。
+   */
+  userType(account) {
+    const explicit = account?.subscription ?? account?.userType;
+    if (explicit === "PRO" || explicit === "PRO_TRIAL" || explicit === "FREE") return explicit;
+    return "FREE";
+  }
+
   /** 选号 + 保证 idToken / AppCheck 都新鲜。 */
   async acquire({ exclude = [], model = "" } = {}) {
     const account = this.pool.pick({ exclude });
@@ -363,6 +423,7 @@ export class CleveraiRelay {
       error.status = 400;
       throw error;
     }
+    const cost = walletCost ?? this.costFor(engine);
     const body = {
       messages: dialog,
       thread: { id: randomUUID() },
@@ -370,16 +431,18 @@ export class CleveraiRelay {
       platform: "web",
       engine,
       module: "CHAT",
-      filters: [],
+      // SPA 在没选过滤条件时发的是字符串 "auto"（不是空数组），照抄更稳。
+      filters: "auto",
       options: {
-        type: "PRO",
+        // 账号的套餐：没买就是 FREE。发 PRO 会让上游按 PRO 权限校验，反而更容易被拒。
+        type: this.userType(account),
         language: "en",
         tools: toUpstreamTools(tools),
       },
       model: engine,
       deviceType: "unknown",
       sequenceNumber: 0,
-      wallet: { ...(account.wallet ?? {}), cost: walletCost },
+      wallet: { ...(account.wallet ?? {}), cost },
       device: account.device ?? { deviceType: "DESKTOP", platform: "web" },
       isDemo: false,
       metadata: { outputProtocol: "mixed-v1", requestId: randomUUID(), capabilities: ["mcp-app-v1"] },
@@ -409,12 +472,16 @@ export class CleveraiRelay {
 
     let finish = "stop";
     const pendingCalls = [];
+    let answer = "";
     for await (const event of iterateSse(response.body, signal)) {
       const delta = normalizeDelta(event);
       if (delta.thinking) {
         // 上游的 thinking 只在需要时透出，OpenAI 侧没有对应字段，丢掉更稳。
       }
-      if (delta.text) yield { type: "text", text: delta.text, engine, account: account.email };
+      if (delta.text) {
+        answer += delta.text;
+        yield { type: "text", text: delta.text, engine, account: account.email };
+      }
       for (const call of delta.toolCalls) {
         pendingCalls.push(call);
         yield { type: "tool_call", call, engine, account: account.email };
@@ -430,8 +497,14 @@ export class CleveraiRelay {
         if (event.finishReason === "error") break;
       }
     }
+    const notice = detectPlaceholder(answer);
+    if (notice) {
+      this.pool.recordNotice(account.id, notice);
+      this.log("warn", `cleverai: ${account.email} 收到上游占位回答（${notice}），已标记`);
+    }
     this.pool.recordResult(account.id, { ok: finish !== "error", error: finish === "error" ? "upstream error" : null, cooldownMs: finish === "error" ? 120_000 : 0 });
-    yield { type: "done", finish, engine, account: account.email, wallet: this.pool.getAccount(account.id)?.wallet ?? null };
+    if (notice) yield { type: "notice", code: notice, engine, account: account.email };
+    yield { type: "done", finish, engine, account: account.email, notice, wallet: this.pool.getAccount(account.id)?.wallet ?? null };
   }
 
   async #handleFailure(account, status, detail) {
@@ -470,12 +543,15 @@ export class CleveraiRelay {
     const calls = [];
     let engine = "";
     let finish = "stop";
+    let notice = "";
     for await (const event of this.chat({ messages, model, tools, signal, walletCost })) {
       if (event.type === "text") textParts.push(event.text);
       else if (event.type === "tool_call") calls.push(event.call);
+      else if (event.type === "notice") notice = event.code;
       else if (event.type === "done") {
         engine = event.engine;
         finish = event.finish;
+        notice = event.notice || notice;
       }
     }
     const message = { role: "assistant", content: textParts.join("") || (calls.length ? null : "") };
@@ -494,6 +570,7 @@ export class CleveraiRelay {
       model: engine || resolveEngine(model),
       choices: [{ index: 0, message, finish_reason: calls.length ? "tool_calls" : finish === "error" ? "stop" : finish }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      ...(notice ? { "x_cleverai_notice": notice } : {}),
     };
   }
 
@@ -539,6 +616,9 @@ export class CleveraiRelay {
           },
         });
         index++;
+      } else if (event.type === "notice") {
+        // SSE 注释帧：客户端会忽略，抓包/日志里能一眼看出这是上游占位回答。
+        yield `: cleverai-notice=${event.code}\n\n`;
       } else if (event.type === "done") {
         engine = event.engine;
         finish = toolIndex.size ? "tool_calls" : event.finish;

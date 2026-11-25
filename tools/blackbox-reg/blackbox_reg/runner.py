@@ -414,7 +414,14 @@ def doctor(config: RunConfig) -> dict[str, Any]:
         checks["browser_stacks"] = stacks or "未安装（pip install 'camoufox[geoip]' && camoufox fetch）"
         version = camoufox_installed_version()
         checks["camoufox"] = (
-            f"内核已就绪 {version}" if version else ("已装 pip 包但没 fetch 内核：camoufox fetch" if "camoufox" in stacks else "未安装")
+            f"内核已就绪 {version}"
+            if version
+            else (
+                "已装 pip 包但没 fetch 内核：`camoufox fetch`"
+                "（GitHub API 限流时先设 GITHUB_TOKEN 再 fetch）"
+                if "camoufox" in stacks
+                else "未安装"
+            )
         )
     except Exception as cause:  # noqa: BLE001
         checks["browser_stacks"] = f"failed: {cause}"

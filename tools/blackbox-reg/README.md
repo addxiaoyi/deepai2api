@@ -15,10 +15,20 @@ Blackbox 的账号体系只有 Google 登录，`POST /api/auth/sign-up/email` �
 cd tools\blackbox-reg
 python -m pip install -r requirements.txt
 # 指纹浏览器（可选，browser 引擎才需要）：任选其一
-python -m pip install camoufox[geoip]     # 推荐：Firefox + C++ 层指纹改写
+python -m pip install "camoufox[geoip]" && camoufox fetch   # 首选：Firefox + C++ 层指纹改写
 python -m pip install patchright && patchright install chromium
-python -m playwright install chromium     # 兜底
+python -m playwright install chromium                      # 兜底
 ```
+
+> Camoufox 的 pip 包**不含浏览器本体**，必须再跑一次 `camoufox fetch`（约 200 MB）。
+> `doctor` 会分别报告"pip 包在不在"和"内核有没有 fetch"。
+> 它兼容现有 Playwright 代码：`from camoufox.sync_api import Camoufox` →
+> `with Camoufox(headless=True, geoip=True, humanize=True) as browser:`。
+> 详见 <https://camoufox.com/python/usage/>。
+>
+> fetch 走 GitHub release API，未登录时会限流（`403 rate limit exceeded`）：
+> 先 `$env:GITHUB_TOKEN="ghp_…"` 再 `camoufox fetch`，或手动下 release 包后
+> `camoufox set <版本>`。doctor 里 `camoufox` 那一行会直接告诉你缺哪一步。
 
 ## 自检
 
@@ -82,6 +92,11 @@ python -m blackbox_reg run -n 5 -c 2 --engine auto --session-file cookies.json `
 | `--keys-path` / `--keys-create-path` / `--keys-create-body` | 覆盖面板 Key 接口探测结果 |
 | `--anti-ban` | 防封策略 JSON（与网关 `DEFAULT_ANTI_BAN` 同名字段） |
 | `--mail-provider` | `domain`（自有域轮换）/ `imap` / `mailtm` / `fixed` |
+| `--browser-stack` | `auto` / `camoufox`（首选）/ `patchright` / `playwright` |
+| `--profile-dir` | camoufox `persistent_context` 的身份档目录（留空=每次全新 profile） |
+| `--storage-state` | playwright `storage_state` 落盘/复用路径（复用登录态） |
+| `--no-geo-align` | 不让时区/语言跟随出口 IP（一般不要关，开了才像本地人） |
+| `--no-disable-coop` | 保留 COOP（默认关掉，否则点不了 cross-origin iframe 里的 Turnstile） |
 | `--out-dir` | sqlite + jsonl + key-endpoints.json + screenshots 的落点 |
 
 IMAP（域名邮箱）环境变量：

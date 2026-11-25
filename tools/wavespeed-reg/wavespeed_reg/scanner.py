@@ -1,5 +1,8 @@
 """WaveSpeed 桌面端 / Android APK 逆向分析器（本地静态分析，不联网、不执行样本）。
 
+注意模块名：叫 `scanner` 而不是 `re` —— 后者会和标准库 `re` 撞名，一旦这个包目录
+进了 sys.path 就会遮蔽标准库，`import re` 全盘失败（实测过）。
+
 ## 为什么需要这一步
 
 WaveSpeed 的网页端能力有限（只有 OAuth，没有建 key 接口），但官方确实发布了：
@@ -26,14 +29,14 @@ WaveSpeed 的网页端能力有限（只有 OAuth，没有建 key 接口），�
 ## 用法
 
     # 自动探测（有哪个分析哪个）
-    python -m wavespeed_reg.re --detect
+    python -m wavespeed_reg.scanner --detect
 
     # 指定文件或目录
-    python -m wavespeed_reg.re --path "C:/Downloads/WaveSpeed-Setup.exe"
-    python -m wavespeed_reg.re --path ./app.asar.unpacked --out ./out/re
+    python -m wavespeed_reg.scanner --path "C:/Downloads/WaveSpeed-Setup.exe"
+    python -m wavespeed_reg.scanner --path ./app.asar.unpacked --out ./out/re
 
     # 只导出端点清单
-    python -m wavespeed_reg.re --path ./apk --only endpoints
+    python -m wavespeed_reg.scanner --path ./apk --only endpoints
 
 输出是 JSON + 一份 Markdown 报告，落在 `--out`（默认 `out/re/`）。
 

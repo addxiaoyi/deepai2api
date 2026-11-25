@@ -521,6 +521,9 @@ class Runner:
                 oauth_wait=self.cfg.browser.oauth_wait,
                 accesskey_wait=self.cfg.browser.accesskey_wait,
                 oauth_credentials=self.cfg.key_policy.get("oauth_credentials") or None,
+                pin_cpu_cores=self.cfg.browser.pin_cpu_cores,
+                use_preset=self.cfg.browser.use_preset,
+                canvas_noise=self.cfg.browser.canvas_noise,
                 log=lambda message: self.log(message, level="debug"),
             ) as browser:
                 result = browser.signup_flow(

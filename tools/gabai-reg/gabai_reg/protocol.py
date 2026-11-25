@@ -115,6 +115,21 @@ def _raise_for(path: str, response: httpx.Response) -> None:
     raise SignupError(f"{path}: failed (HTTP {status})", detail=detail)
 
 
+def _json_body(response: httpx.Response, path: str) -> Any:
+    """Parse a JSON body, turning an HTML wall into a typed `Blocked`.
+
+    Cloudflare answers `200 text/html "Just a moment..."` often enough that a raw
+    `response.json()` would blow up with a JSONDecodeError and the runner would
+    classify it as an unknown error instead of rotating the proxy.
+    """
+    try:
+        return response.json() if response.content else {}
+    except (json.JSONDecodeError, ValueError) as exc:
+        if _looks_blocked(response):
+            raise Blocked(f"{path}: edge answered with a bot challenge", detail=(response.text or "")[:300]) from exc
+        raise SignupError(f"{path}: response is not JSON", detail=(response.text or "")[:300]) from exc
+
+
 class GabSession:
     """One signup/login session; bearer is stored in-memory."""
 
@@ -159,9 +174,11 @@ class GabSession:
         if client_info:
             body["clientInfo"] = client_info
         response = request(self.client, "POST", f"{self.base}{SIGNUP}", json=body, headers={"Content-Type": "application/json"})
+        if _looks_blocked(response):
+            raise Blocked(f"{SIGNUP}: edge answered with a bot challenge", detail=(response.text or "")[:300])
         if response.status_code >= 400:
             _raise_for(SIGNUP, response)
-        payload = response.json() if response.content else {}
+        payload = _json_body(response, SIGNUP)
         if isinstance(payload, dict) and payload.get("error") is True:
             raise SignupError(payload.get("message") or "signup failed", detail=payload)
         self._capture_tokens(payload)
@@ -172,9 +189,11 @@ class GabSession:
         if client_info:
             body["clientInfo"] = client_info
         response = request(self.client, "POST", f"{self.base}{LOGIN}", json=body, headers={"Content-Type": "application/json"})
+        if _looks_blocked(response):
+            raise Blocked(f"{LOGIN}: edge answered with a bot challenge", detail=(response.text or "")[:300])
         if response.status_code >= 400:
             _raise_for(LOGIN, response)
-        payload = response.json() if response.content else {}
+        payload = _json_body(response, LOGIN)
         if isinstance(payload, dict) and payload.get("error") is True:
             raise SignupError(payload.get("message") or "login failed", detail=payload)
         self._capture_tokens(payload)

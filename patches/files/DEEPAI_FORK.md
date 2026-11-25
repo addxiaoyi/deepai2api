@@ -15,6 +15,7 @@ upstream release, re-apply these five files.
 | `src/lib/apis/deepai/index.ts` | new | Frontend API client |
 | `src/lib/components/admin/Settings/DeepAI.svelte` | new | The settings page (gateway, account pool, keys, models) |
 | `src/lib/components/admin/Settings/MoonAI.svelte` | new | MoonAI provider card (own pool / register / probe / export / coding-tool base URLs), mounted at the bottom of the same settings page |
+| `src/lib/components/admin/Settings/Pools.svelte` | new | 号池总览（六条线一张表）+ **Clever AI Hub** 与 **Gab AI** 两张卡：注册 / App Check 续期 / 池表格 / 导入导出 / 补建 key，同样挂在设置页底部 |
 | `backend/open_webui/main.py` | +2 lines | `deepai` in the routers import list; `app.include_router(deepai.router, prefix='/api/v1/deepai', tags=['deepai'])` |
 | `src/lib/components/chat/SettingsModal.svelte` | +4 blocks | Import the page, add `admin:deepai` to the tab list and its group, render the panel |
 | `src/lib/components/admin/Settings/AdminTabIcon.svelte` | +2 lines | Icon for the new tab (`GlobeAlt`) |
@@ -84,6 +85,17 @@ All require an Open WebUI **admin** session (`get_admin_user`).
 | `GET /api/v1/deepai/providers/{id}/keys` | Panel key + org + token expiry, no plaintext |
 | `POST /api/v1/deepai/providers/{id}/probe` | One upstream call with a pooled token |
 | `GET /api/v1/deepai/providers/{id}/connect` | OpenAI / Anthropic base URLs for coding tools |
+| `GET /api/v1/deepai/pools` | 六条线号池总览（DeepAI / Allmodels / Poe / providers / Clever AI / Gab AI），面板一张表 |
+| `GET /api/v1/deepai/cleverai/status` | Clever AI job 快照 + App Check 是否就绪 |
+| `POST /api/v1/deepai/cleverai/register` | 起批量注册（count / concurrency / engine / mailProvider / mailDomains / appcheck / proxies） |
+| `POST /api/v1/deepai/cleverai/register/stop` | 停任务（Windows 整棵进程树） |
+| `GET /api/v1/deepai/cleverai/pool` · `POST …/pool/import` · `POST …/pool/export` · `DELETE …/pool/{id}` | 号池读/写/导出/移除 |
+| `POST /api/v1/deepai/cleverai/appcheck` | 强制续期一枚 App Check JWT（会开一次浏览器） |
+| `GET /api/v1/deepai/cleverai/connect` | OpenAI / Anthropic base URL + 可用 Key 前缀 |
+| `GET /api/v1/deepai/gabai/status` · `POST …/register` · `POST …/register/stop` | Gab AI job 控制 |
+| `GET /api/v1/deepai/gabai/pool` · `POST …/pool/import` · `POST …/pool/export` · `DELETE …/pool/{id}` | Gab AI 号池读写 |
+| `POST /api/v1/deepai/gabai/pool/{id}/mint` | 网页反代出 apikey：用账号登录态在 gab.ai 上补建一把 `gab_…` |
+| `GET /api/v1/deepai/gabai/connect` | OpenAI / Anthropic base URL + 可用 Key 前缀 |
 
 ## MoonAI card (separate provider line)
 

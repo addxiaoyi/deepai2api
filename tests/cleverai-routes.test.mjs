@@ -19,9 +19,10 @@ function startGateway() {
     base: "http://127.0.0.1:1",
     instance: "test",
     getCatalog: async () => [],
+    getAllowance: async () => null,
     checkInFor: () => null,
   };
-  const scheduler = { candidates: () => [], record: () => {}, pin: () => {} };
+  const scheduler = { candidates: () => [], record: () => {}, pin: () => {}, status: () => ({}) };
   const gateway = createGateway({ config, lane, store, scheduler, log: () => {} });
   return { gateway, store, dir };
 }
@@ -202,5 +203,56 @@ test("pool export writes a downloadable file in all three formats", async () => 
       assert.ok(text.includes("exp@example.com"), `export ${format} must contain the account`);
       assert.match(res.headers.get("content-disposition") ?? "", /attachment/);
     }
+  });
+});
+test("/cleverai/v1/messages speaks Anthropic and validates input", async () => {
+  await withServer(async ({ base }) => {
+    const anonymous = await fetch(`${base}/cleverai/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "cleverai/default", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(anonymous.status, 401, "the Anthropic surface needs a gateway key too");
+
+    const created = await (
+      await fetch(`${base}/api/admin/cleverai/pool/import`, {
+        method: "POST",
+        headers: { ...admin, ...json() },
+        body: JSON.stringify({ email: "anthropic@example.com", refreshToken: "rt-anthropic" }),
+      })
+    ).json();
+    const key = created.gatewayKey.plaintext;
+
+    const empty = await fetch(`${base}/cleverai/v1/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, ...json() },
+      body: JSON.stringify({ model: "cleverai/default", messages: [] }),
+    });
+    assert.equal(empty.status, 400);
+    const body = await empty.json();
+    assert.match(body.error.message, /messages/);
+
+    const unknown = await fetch(`${base}/cleverai/v1/not-a-route`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, ...json() },
+      body: "{}",
+    });
+    assert.equal(unknown.status, 404);
+  });
+});
+test("admin state exposes the cleverai block", async () => {
+  await withServer(async ({ base }) => {
+    await fetch(`${base}/api/admin/login`, {
+      method: "POST",
+      headers: json(),
+      body: JSON.stringify({ token: "test-token" }),
+    });
+    const state = await (await fetch(`${base}/api/admin/state`, { headers: admin })).json();
+    assert.equal(state.ok, true);
+    assert.ok(state.cleverai, "panel state must carry cleverai");
+    assert.equal(state.cleverai.pool.schema, "dcg.pool/cleverai@1");
+    assert.equal(state.cleverai.engine, "openai-gpt-6-luna");
+    assert.equal(state.cleverai.running, false);
+    assert.ok(state.allmodels, "allmodels block untouched");
   });
 });

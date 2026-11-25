@@ -111,6 +111,7 @@ export class CleveraiPool {
       updatedAt: this.state.updatedAt ?? null,
       last24h: 0,
       engines: {},
+      placeholderReplies: 0,
     };
     const dayAgo = now - 24 * 3600 * 1000;
     for (const account of this.state.accounts) {
@@ -122,6 +123,7 @@ export class CleveraiPool {
       if (account.emailVerified === true) out.verified++;
       out.credits += Number(account.wallet?.totalCredit ?? 0);
       out.requests += account.requests ?? 0;
+      out.placeholderReplies += Number(account.notices?.total ?? 0);
       if (account.createdAt && Date.parse(account.createdAt) >= dayAgo) out.last24h++;
       const engine = account.engine ?? "protocol";
       out.engines[engine] = (out.engines[engine] ?? 0) + 1;
@@ -225,6 +227,26 @@ export class CleveraiPool {
     return account;
   }
 
+  /**
+   * 上游占位回答计数。
+   *
+   * 这些 engine 的模型层对普通账号只回套话（见 docs/CLEVERAI-POOL.md），转发层
+   * 把每次命中记下来：一是给面板看，二是别把它当"模型答得好"混过去。它不触发
+   * 冷却 —— 这不是账号的问题，换号也一样。
+   */
+  recordNotice(id, code) {
+    const account = this.getAccount(id);
+    if (!account) return null;
+    const notices = account.notices ?? { total: 0, byCode: {} };
+    notices.total += 1;
+    notices.byCode[code] = (notices.byCode[code] ?? 0) + 1;
+    notices.lastAt = new Date().toISOString();
+    account.notices = notices;
+    account.updatedAt = notices.lastAt;
+    this.save();
+    return account;
+  }
+
   /* ---------------------------------------------------------------- exports */
 
   records() {
@@ -304,6 +326,7 @@ export function normalizeAccount(raw = {}) {
     appCheckExp: clamp(raw.appCheckExp ?? raw.app_check_exp ?? 0, 0, Number.MAX_SAFE_INTEGER),
     wallet: raw.wallet && typeof raw.wallet === "object" ? raw.wallet : {},
     device: raw.device && typeof raw.device === "object" ? raw.device : {},
+    notices: raw.notices && typeof raw.notices === "object" ? raw.notices : undefined,
     emailVerified: raw.emailVerified ?? raw.email_verified ?? null,
     status: raw.status ?? "active",
     engine: raw.engine ?? "protocol",

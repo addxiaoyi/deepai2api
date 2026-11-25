@@ -197,7 +197,49 @@ client.balance()   # {'availableBalance': 125000, 'usd': 12.5}
 
 原始值是 1/10000 USD 的整数，`balance()` 会额外算一个 `usd` 字段。
 
-## 8. 测试
+## 8. 指纹浏览器：camoufox 的实测约束
+
+与 wavespeed worker 共用同一套修正（`novita_reg/camoufox_options.py`）：
+
+| 约束 | 症状 |
+| --- | --- |
+| `timezone` 不是合法参数 | `TypeError: unexpected keyword argument 'timezone'`，启动失败 |
+| `os` 传多元素列表 | `InvalidConstraints: no possible values for "os"` |
+| `screen` 容不下 `window` | `InvalidConstraints` |
+
+关键点：
+
+- 时区只能靠 `geoip=<IP>`；`geoip=True` 会拿**本机** IP（比不设更糟），
+  传域名会 `InvalidIP`。`geoip_target()` 负责把代理 host 解析成 IP，失败就不传并记日志。
+- `fingerprint_preset` 默认不传 —— 捆绑预设会让多账号抽到同一个指纹，
+  对 Novita 的"同设备多账号"风控尤其致命。
+- `pin_cpu_cores` 默认开 —— 否则泄露宿主核数（本机 32）。
+
+```yaml
+browser:
+  pin_cpu_cores: true
+  use_preset: false
+  canvas_noise: null
+  geoip: true
+```
+
+多账号隔离仍由 `profile_isolation_plan()` 保证（独立 profile 目录 + 独立噪声种子）；
+camoufox 的参数修正不影响这一层。
+
+验证真的能启动（不要只信 auto 降级的结果）：
+
+```bash
+python -c "
+import sys; sys.path.insert(0,'.')
+from novita_reg.browser import FingerprintBrowser
+with FingerprintBrowser(stack='camoufox', proxy='http://8.8.8.8:8080', log=print) as b:
+    b.page.goto('about:blank')
+    print(b.stack, b.page.evaluate('Intl.DateTimeFormat().resolvedOptions().timeZone'))
+"
+# 期望：camoufox America/Los_Angeles（由 geoip 的 IP 定位决定）
+```
+
+## 9. 测试
 
 ```bash
 cd tools/novita-reg
@@ -209,7 +251,7 @@ python tests/test_offline.py
 注册请求体字段（`cloudflareToken` / `confirmPassword` / `agreementVersion`）、
 HTTP 200 + `errorNo` 的处理、建 key 拿明文、profile 隔离计划。
 
-## 9. 限制
+## 10. 限制
 
 - **Turnstile 必过**：sitekey 已知，但 token 需要解题器或真实浏览器；
   `--captcha auto` 会先不带 token 试一次，被拒再按配置解题。

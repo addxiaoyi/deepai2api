@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { CleveraiPool, POOL_SCHEMA, importAccount, maskAccount } from "../src/cleverai-pool.mjs";
 import {
   CleveraiRelay,
+  detectPlaceholder,
   normalizeDelta,
   resolveEngine,
   toDialogMessages,
@@ -272,4 +273,68 @@ test("complete() folds the stream into one assistant message with tool_calls", a
   assert.equal(out.choices[0].message.tool_calls[0].function.name, "shell");
   assert.equal(out.choices[0].finish_reason, "tool_calls");
   assert.equal(out.model, "openai-gpt-6-luna");
+});
+test("placeholder replies from the upstream are recognised", () => {
+  assert.equal(
+    detectPlaceholder("Please update to the latest version. This update includes essential bug fixes"),
+    "update_required",
+  );
+  assert.equal(
+    detectPlaceholder("We apologize for the inconvenience. Our service is currently experiencing heavy traffic"),
+    "heavy_traffic",
+  );
+  assert.equal(detectPlaceholder("**Clever AI** is _analyzing_ your request...\n"), "analyzing");
+  assert.equal(detectPlaceholder("pong"), "");
+  assert.equal(detectPlaceholder(""), "");
+});
+
+test("complete() carries the placeholder code and the pool counts it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-pool-"));
+  const pool = new CleveraiPool(join(dir, "pool.json"));
+  const account = pool.add(sample()).account;
+  const relay = new CleveraiRelay({ pool });
+
+  relay.chat = async function* () {
+    yield { type: "text", text: "**Clever AI** is _analyzing_ your request...\nPlease update to the latest version." };
+    yield { type: "notice", code: "update_required" };
+    yield { type: "done", finish: "stop", engine: "openai-gpt-6-luna", notice: "update_required" };
+  };
+
+  const out = await relay.complete({ messages: [{ role: "user", content: "hi" }], model: "cleverai/default" });
+  assert.equal(out["x_cleverai_notice"], "update_required");
+
+  pool.recordNotice(account.id, "update_required");
+  const stats = pool.stats();
+  assert.equal(stats.placeholderReplies, 1);
+  assert.equal(pool.getAccount(account.id).notices.byCode.update_required, 1);
+});
+
+test("streamOpenAI emits an SSE comment when the reply is a placeholder", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-pool-"));
+  const pool = new CleveraiPool(join(dir, "pool.json"));
+  const relay = new CleveraiRelay({ pool });
+  relay.chat = async function* () {
+    yield { type: "text", text: "Service is currently experiencing heavy traffic" };
+    yield { type: "notice", code: "heavy_traffic" };
+    yield { type: "done", finish: "stop", engine: "antropic-calude-sonnet-5-5", notice: "heavy_traffic" };
+  };
+  const chunks = [];
+  for await (const chunk of relay.streamOpenAI({ messages: [{ role: "user", content: "hi" }], model: "" })) {
+    chunks.push(chunk);
+  }
+  assert.ok(chunks.some((c) => c.includes("cleverai-notice=heavy_traffic")), "notice must be visible in the stream");
+  assert.equal(chunks.at(-1), "data: [DONE]\n\n");
+});
+test("costFor / userType follow the upstream catalog", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-pool-"));
+  const pool = new CleveraiPool(join(dir, "pool.json"));
+  const relay = new CleveraiRelay({ pool });
+  assert.equal(relay.costFor("openai-gpt-6-luna"), 2);
+  assert.equal(relay.costFor("cleverai/openai-gpt-6-luna"), 2);
+  assert.equal(relay.costFor("google-gemini-4-argon"), 30);
+  assert.equal(relay.costFor("totally-unknown-engine"), 2);
+  assert.equal(relay.userType({}), "FREE");
+  assert.equal(relay.userType({ subscription: "PRO" }), "PRO");
+  assert.equal(relay.userType({ userType: "PRO_TRIAL" }), "PRO_TRIAL");
+  assert.equal(relay.userType({ subscription: "bogus" }), "FREE");
 });

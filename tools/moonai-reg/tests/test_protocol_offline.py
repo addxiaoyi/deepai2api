@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+# 允许从仓库根跑 `python -m pytest tools/moonai-reg/tests`（与其它 worker 一致）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from moonai_reg.config import RunConfig
 from moonai_reg.errors import EmailTaken, NoApiKey, NoToken

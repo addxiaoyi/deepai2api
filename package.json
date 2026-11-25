@@ -24,7 +24,13 @@
     "sandbox:sim": "node tools/novita-reg/sandbox-sim.mjs",
     "test:novita": "node --test tests/novita-pool.test.mjs && python -m pytest tools/novita-reg/tests -q",
     "test:blackbox": "node --test tests/blackbox-provider.test.mjs && python -m unittest discover -s tools/blackbox-reg/tests && node tests/blackbox-e2e.mjs",
-    "blackbox": "cd tools/blackbox-reg && python -m blackbox_reg"
+    "blackbox": "cd tools/blackbox-reg && python -m blackbox_reg",
+    "loop": "node scripts/check-loop.mjs",
+    "test:gabai": "node --test tests/gabai-routes.test.mjs",
+    "test:loop": "node scripts/check-loop.mjs && node --test tests/cleverai-pool.test.mjs tests/cleverai-routes.test.mjs tests/gabai-routes.test.mjs",
+    "test:workers": "python -m pytest tools/cleverai-reg/tests tools/gabai-reg/tests tools/zo-reg/tests tools/allmodels-reg/tests tools/novita-reg/tests tools/wavespeed-reg/tests tools/blackbox-reg/tests tools/poe-reg/tests tools/deepai-reg/tests tools/moonai-reg/tests --import-mode=importlib -q",
+    "test:all": "npm run loop && npm run test:loop && npm run test:fork && npm run test:workers && node tests/e2e.mjs && npm run test:providers",
+    "test:fork": "node --test tests/fork-pools-surface.test.mjs tests/moonai-fork-surface.test.mjs"
   },
   "engines": {
     "node": ">=20"

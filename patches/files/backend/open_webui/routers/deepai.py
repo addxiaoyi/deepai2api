@@ -631,3 +631,326 @@ async def provider_connect_info(provider_id: str, user=Depends(get_admin_user)):
         "key_prefix": (usable[0].get("prefix") if usable else "") or "",
         "keys": len(usable),
     }
+
+
+# ------------------------------------------------------- 号池总览 + 两条新线
+#
+# 网关现在有六条线：DeepAI（state）、Allmodels、Poe、Provider 运行时
+# （wavespeed/novita/moonai/zo/blackbox）、Clever AI Hub、Gab AI。
+# 下面三组路由把它们接进面板：
+#   GET /pools                   一次性拿到所有线的号池统计（总览卡片）
+#   /cleverai/*                  Clever AI Hub（Firebase + App Check）
+#   /gabai/*                     Gab AI（gab_ key，直通反代）
+#
+# 全部只是转发：号池文件、注册锁、job 状态都在网关侧，面板不持有任何凭据。
+
+
+class CleveraiRegisterForm(BaseModel):
+    count: int = 1
+    concurrency: int = 1
+    engine: str = "auto"  # auto | protocol | browser
+    browser_stack: str = "auto"
+    mail_provider: str = "imap"
+    mail_domains: list[str] = []
+    appcheck: str = "browser"  # browser | capsolver | manual
+    captcha_key: Optional[str] = None
+    appcheck_token: Optional[str] = None
+    chat_engine: Optional[str] = None
+    proxies: list[str] = []
+    cdp: Optional[str] = None
+    headful: bool = False
+    humanize: float = 0
+    verify_email: bool = True
+    warmup: bool = True
+    export: Optional[str] = None
+
+
+class GabaiRegisterForm(BaseModel):
+    count: int = 1
+    concurrency: int = 1
+    engine: str = "auto"
+    browser_stack: str = "auto"
+    mail_provider: str = "imap"
+    mail_domains: list[str] = []
+    email: Optional[str] = None
+    captcha: str = "none"
+    captcha_key: Optional[str] = None
+    proxies: list[str] = []
+    cdp: Optional[str] = None
+    headful: bool = False
+    humanize: float = 0
+    verify_email: bool = False
+    create_api_key: bool = True
+    export: Optional[str] = None
+
+
+class PoolImportForm(BaseModel):
+    account: dict
+    mint_key: bool = True
+
+
+@router.get("/pools")
+async def pools_overview(user=Depends(get_admin_user)):
+    """六条线的号池总览：一次请求，面板只画一张表。"""
+    health = await gw("/health", timeout=20)
+    lines = [
+        {
+            "id": "deepai",
+            "label": "DeepAI Code",
+            "accounts": health.get("accounts", 0),
+            "healthy": health.get("healthy_accounts", 0),
+            "keys": health.get("keys", 0),
+            "proxy_base": "/v1",
+            "extra": {"is_pro": (health.get("account") or {}).get("isPro")},
+        }
+    ]
+    allmodels = health.get("allmodels") or {}
+    lines.append(
+        {
+            "id": "allmodels",
+            "label": "Allmodels",
+            "accounts": allmodels.get("accounts", 0),
+            "healthy": allmodels.get("healthy", 0),
+            "keys": allmodels.get("keys", 0),
+            "proxy_base": "",
+        }
+    )
+    poe = health.get("poe") or {}
+    lines.append(
+        {
+            "id": "poe",
+            "label": "Poe",
+            "accounts": poe.get("total", 0),
+            "healthy": poe.get("active", 0),
+            "keys": 0,
+            "proxy_base": "",
+            "extra": {
+                "email_verified": poe.get("email_verified", 0),
+                "phone_required": poe.get("phone_required", 0),
+                "dead": poe.get("dead", 0),
+            },
+        }
+    )
+    for pid, stat in (health.get("providers") or {}).items():
+        lines.append(
+            {
+                "id": pid,
+                "label": pid,
+                "accounts": stat.get("accounts", 0),
+                "healthy": stat.get("healthy", 0),
+                "keys": stat.get("keys", 0),
+                "proxy_base": f"/p/{pid}/v1",
+                "running": stat.get("running", False),
+            }
+        )
+    cleverai = health.get("cleverai") or {}
+    lines.append(
+        {
+            "id": "cleverai",
+            "label": "Clever AI Hub",
+            "accounts": cleverai.get("accounts", 0),
+            "healthy": cleverai.get("healthy", 0),
+            "keys": cleverai.get("keys", 0),
+            "proxy_base": "/cleverai/v1",
+            "extra": {"app_check": cleverai.get("appCheck"), "credits": cleverai.get("credits", 0)},
+        }
+    )
+    gabai = health.get("gabai") or {}
+    lines.append(
+        {
+            "id": "gabai",
+            "label": "Gab AI",
+            "accounts": gabai.get("accounts", 0),
+            "healthy": gabai.get("healthy", 0),
+            "keys": gabai.get("keys", 0),
+            "proxy_base": "/gab/v1",
+        }
+    )
+    return {"gateway": await get_gateway_url(), "lines": lines}
+
+
+# ---------------------------------------------------------------- Clever AI
+
+
+@router.get("/cleverai/status")
+async def cleverai_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/cleverai/status", timeout=30)
+
+
+@router.post("/cleverai/register")
+async def cleverai_register(form_data: CleveraiRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "engine": form_data.engine,
+        "browserStack": form_data.browser_stack,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "appcheck": form_data.appcheck,
+        "captchaKey": form_data.captcha_key,
+        "appcheckToken": form_data.appcheck_token,
+        "chatEngine": form_data.chat_engine,
+        "proxies": form_data.proxies,
+        "cdp": form_data.cdp,
+        "headful": form_data.headful,
+        "humanize": form_data.humanize,
+        "verifyEmail": form_data.verify_email,
+        "warmup": form_data.warmup,
+        "export": form_data.export,
+        "push": True,
+    }
+    return await gw("/api/admin/cleverai/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/cleverai/register/stop")
+async def cleverai_register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/cleverai/register/stop", method="POST", timeout=30)
+
+
+@router.get("/cleverai/pool")
+async def cleverai_pool(limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/cleverai/pool?limit={limit}", timeout=30)
+
+
+@router.post("/cleverai/pool/import")
+async def cleverai_pool_import(form_data: PoolImportForm, user=Depends(get_admin_user)):
+    body = dict(form_data.account)
+    body["mintKey"] = form_data.mint_key
+    return await gw("/api/admin/cleverai/pool/import", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/cleverai/pool/export")
+async def cleverai_pool_export(
+    format: str = "jsonl", download: int = 0, user=Depends(get_admin_user)
+):
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/cleverai/pool/export{query}")
+        filename = f"cleverai-accounts.{'csv' if format == 'csv' else 'jsonl' if format == 'jsonl' else 'json'}"
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return await gw(f"/api/admin/cleverai/pool/export{query}", method="POST", timeout=30)
+
+
+@router.delete("/cleverai/pool/{account_id}")
+async def cleverai_pool_delete(account_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/cleverai/pool/{account_id}", method="DELETE", timeout=30)
+
+
+@router.get("/cleverai/keys")
+async def cleverai_keys(user=Depends(get_admin_user)):
+    return await gw("/api/admin/cleverai/keys", timeout=30)
+
+
+@router.post("/cleverai/appcheck")
+async def cleverai_appcheck(user=Depends(get_admin_user)):
+    """强制续期一枚 App Check 令牌（会开一次浏览器，约 5–15 s）。"""
+    return await gw("/api/admin/cleverai/appcheck", method="POST", timeout=180)
+
+
+@router.get("/cleverai/connect")
+async def cleverai_connect_info(user=Depends(get_admin_user)):
+    base = await get_gateway_url()
+    keys = await gw("/api/admin/keys", timeout=30)
+    rows = keys.get("keys") if isinstance(keys, dict) else None
+    usable = [k for k in (rows or []) if not k.get("revoked")]
+    return {
+        "openai_base": f"{base}/cleverai/v1",
+        "anthropic_base": f"{base}/cleverai",
+        "key_prefix": (usable[0].get("prefix") if usable else "") or "",
+        "keys": len(usable),
+        "notice_header": "X-Cleverai-Notice",
+    }
+
+
+# ------------------------------------------------------------------- Gab AI
+
+
+@router.get("/gabai/status")
+async def gabai_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/gabai/status", timeout=30)
+
+
+@router.post("/gabai/register")
+async def gabai_register(form_data: GabaiRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "engine": form_data.engine,
+        "browserStack": form_data.browser_stack,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "email": form_data.email,
+        "captcha": form_data.captcha,
+        "captchaKey": form_data.captcha_key,
+        "proxies": form_data.proxies,
+        "cdp": form_data.cdp,
+        "headful": form_data.headful,
+        "humanize": form_data.humanize,
+        "verifyEmail": form_data.verify_email,
+        "createApiKey": form_data.create_api_key,
+        "export": form_data.export,
+        "push": True,
+    }
+    return await gw("/api/admin/gabai/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/gabai/register/stop")
+async def gabai_register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/gabai/register/stop", method="POST", timeout=30)
+
+
+@router.get("/gabai/pool")
+async def gabai_pool(limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/gabai/pool?limit={limit}", timeout=30)
+
+
+@router.post("/gabai/pool/import")
+async def gabai_pool_import(form_data: PoolImportForm, user=Depends(get_admin_user)):
+    body = dict(form_data.account)
+    body["mintKey"] = form_data.mint_key
+    return await gw("/api/admin/gabai/pool/import", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/gabai/pool/{account_id}/mint")
+async def gabai_pool_mint(account_id: str, user=Depends(get_admin_user)):
+    """网页反代出 apikey：用账号登录态在 gab.ai 上补建一把 `gab_…` key。"""
+    return await gw(f"/api/admin/gabai/pool/{account_id}/mint", method="POST", timeout=90)
+
+
+@router.post("/gabai/pool/export")
+async def gabai_pool_export(
+    format: str = "jsonl", download: int = 0, user=Depends(get_admin_user)
+):
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/gabai/pool/export{query}")
+        filename = f"gabai-accounts.{'csv' if format == 'csv' else 'jsonl' if format == 'jsonl' else 'json'}"
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return await gw(f"/api/admin/gabai/pool/export{query}", method="POST", timeout=30)
+
+
+@router.delete("/gabai/pool/{account_id}")
+async def gabai_pool_delete(account_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/gabai/pool/{account_id}", method="DELETE", timeout=30)
+
+
+@router.get("/gabai/connect")
+async def gabai_connect_info(user=Depends(get_admin_user)):
+    base = await get_gateway_url()
+    keys = await gw("/api/admin/keys", timeout=30)
+    rows = keys.get("keys") if isinstance(keys, dict) else None
+    usable = [k for k in (rows or []) if not k.get("revoked")]
+    return {
+        "openai_base": f"{base}/gab/v1",
+        "anthropic_base": f"{base}/gab",
+        "key_prefix": (usable[0].get("prefix") if usable else "") or "",
+        "keys": len(usable),
+    }

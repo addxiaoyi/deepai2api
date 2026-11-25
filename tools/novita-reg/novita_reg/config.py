@@ -101,6 +101,10 @@ class BrowserConfig:
     turnstile_timeout: float = 50.0
     screenshots: bool = True
     profile_dir: str = ""
+    # ---- camoufox 专属调节（默认值来自实测，见 camoufox_options.py）----
+    pin_cpu_cores: bool = True      # 核数跟随指纹而非泄露宿主（代价：并发启动串行化）
+    use_preset: bool = False        # 用捆绑指纹预设；批量会抽到重复，默认关
+    canvas_noise: bool | None = None  # None = 由 camoufox 按身份/宿主差异决定
     signup_wait: float = 90.0
     verify_wait: float = 180.0
     keygen_wait: float = 60.0
@@ -354,6 +358,11 @@ class Config:
             signup_wait=float(browser_raw.get("signup_wait", 90.0) or 90.0),
             verify_wait=float(browser_raw.get("verify_wait", 180.0) or 180.0),
             keygen_wait=float(browser_raw.get("keygen_wait", 60.0) or 60.0),
+            pin_cpu_cores=bool(browser_raw.get("pin_cpu_cores", True)),
+            use_preset=bool(browser_raw.get("use_preset", False)),
+            canvas_noise=(
+                None if browser_raw.get("canvas_noise") is None else bool(browser_raw.get("canvas_noise"))
+            ),
         )
 
         cfg.key_policy = KeyPolicyConfig(
@@ -368,6 +377,22 @@ class Config:
 
         for key, value in (overrides or {}).items():
             if value is None:
+                continue
+            # 嵌套块逐字段合并，不能 setattr 整个 dataclass
+            if key == "browser" and isinstance(value, dict):
+                for field_name, field_value in value.items():
+                    if hasattr(cfg.browser, field_name) and field_value is not None:
+                        setattr(cfg.browser, field_name, field_value)
+                continue
+            if key == "mail" and isinstance(value, dict):
+                for field_name, field_value in value.items():
+                    if hasattr(cfg.mail, field_name) and field_value is not None:
+                        setattr(cfg.mail, field_name, field_value)
+                continue
+            if key == "captcha" and isinstance(value, dict):
+                for field_name, field_value in value.items():
+                    if hasattr(cfg.captcha, field_name) and field_value is not None:
+                        setattr(cfg.captcha, field_name, field_value)
                 continue
             if key == "mail_provider":
                 cfg.mail.provider = str(value)

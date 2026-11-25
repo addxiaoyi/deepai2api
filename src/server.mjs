@@ -24,6 +24,9 @@ import {
 } from "./cleverai-pool.mjs";
 import { CleveraiRegistrations } from "./cleverai-register.mjs";
 import { CleveraiRelay, resolveEngine as resolveCleveraiEngine } from "./cleverai-relay.mjs";
+import { GabaiPool, importAccount as importGabaiAccount, maskAccount as maskGabaiAccount } from "./gabai-pool.mjs";
+import { GabaiRegistrations } from "./gabai-register.mjs";
+import { GAB_PATHS, GabaiProxy } from "./gabai-proxy.mjs";
 import { PoePool } from "./poe-pool.mjs";
 import { createProviderRuntime } from "./providers.mjs";
 import { createProviderAdmin } from "./provider-admin.mjs";
@@ -254,6 +257,36 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     engine: cleveraiPool.engine,
     log: (level, message) => log(level === "warn" ? "warn" : "info", message),
   });
+
+  /**
+   * gab.ai 号池：凭据是面板签发的 `gab_…` key，上游本身就说 OpenAI / Anthropic，
+   * 所以反代层只做换 Authorization + 轮询 + 故障切换，不需要形状翻译。
+   * 命名空间 `/gab/v1/*`、`/api/admin/gabai/*`，与其它线零重叠。
+   */
+  const gabaiPool = GabaiPool.at(config.dataDir, {
+    baseUrl: process.env.GABAI_BASE_URL || "https://gab.ai",
+    apiBase: process.env.GABAI_API_BASE || "https://gab.ai/v1",
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
+  const gabai = new GabaiRegistrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    pool: gabaiPool,
+    store,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account, gatewayKey }) => {
+      log("info", `gabai 入池 ${account.email}（号池 ${gabaiPool.size}，网关 Key ${gatewayKey?.prefix ?? "-"}）`);
+    },
+  });
+
+  const gabaiProxy = new GabaiProxy({
+    pool: gabaiPool,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    upstreamBase: process.env.GABAI_UPSTREAM || "https://gab.ai",
+  });
+
 
 
   const bump = (model) => {
@@ -724,7 +757,8 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
       try {
         const completion = await cleveraiRelay.complete({ messages, model, tools, signal: controller.signal });
-        return sendJson(res, 200, completion);
+        const notice = completion["x_cleverai_notice"];
+        return sendJson(res, 200, completion, notice ? { "X-Cleverai-Notice": String(notice) } : {});
       } catch (cause) {
         return fail(res, cause);
       }
@@ -732,6 +766,82 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     if (path === "/cleverai/v1/usage" && req.method === "GET") {
       return sendJson(res, 200, { ok: true, pool: cleveraiPool.stats(), relay: cleveraiRelay.status() });
+    }
+
+    // Anthropic 面：Claude Code / 任何说 /v1/messages 的客户端。
+    // 复用既有翻译层（messagesToChat / chatToMessage / streamAsAnthropic），
+    // 中间只换成 cleverai 的号池与 tools 映射。
+    if (path === "/cleverai/v1/messages" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const chat = messagesToChat(body, { model: String(body.model ?? cleveraiPool.engine) });
+      if (!Array.isArray(chat.messages) || !chat.messages.length) {
+        return sendJson(res, 400, errorBody("messages 不能为空。", "invalid_request_error", "bad_request"));
+      }
+      const controller = new AbortController();
+      res.on("close", () => controller.abort());
+      const engine = resolveCleveraiEngine(chat.model || cleveraiPool.engine);
+      const requestId = `msg_${randomBytes(12).toString("hex")}`;
+      bump(`cleverai/${engine}`);
+
+      if (body.stream === true) {
+        stats.streams++;
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-store",
+          "X-Accel-Buffering": "no",
+        });
+        const openAiChunks = (async function* () {
+          const encoder = new TextEncoder();
+          for await (const chunk of cleveraiRelay.streamOpenAI({
+            messages: chat.messages,
+            model: chat.model,
+            tools: chat.tools,
+            signal: controller.signal,
+          })) {
+            yield encoder.encode(chunk);
+          }
+        })();
+        try {
+          for await (const event of streamAsAnthropic(openAiChunks, { model: engine, requestId })) {
+            if (res.writableEnded) break;
+            if (!res.write(event)) {
+              await new Promise((resolve) => {
+                res.once("drain", resolve);
+                res.once("close", resolve);
+              });
+            }
+          }
+        } catch (cause) {
+          log("error", `cleverai anthropic stream failed: ${cause?.message ?? cause}`);
+          if (!res.writableEnded) res.destroy();
+          return;
+        }
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
+      try {
+        const completion = await cleveraiRelay.complete({
+          messages: chat.messages,
+          model: chat.model,
+          tools: chat.tools,
+          signal: controller.signal,
+        });
+        const notice = completion["x_cleverai_notice"];
+        return sendJson(
+          res,
+          200,
+          chatToMessage(completion, { model: engine, requestId }),
+          notice ? { "X-Cleverai-Notice": String(notice) } : {},
+        );
+      } catch (cause) {
+        return fail(res, cause);
+      }
     }
 
     return sendJson(
@@ -830,6 +940,40 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
               failed: allmodels.job.failed ?? 0,
               startedAt: allmodels.job.startedAt,
               finishedAt: allmodels.job.finishedAt ?? null,
+            }
+          : null,
+      },
+      // 面板读 /api/admin/state 时就能看到这两条线，不用额外请求。
+      gabai: {
+        pool: gabaiPool.stats(),
+        running: gabai.job?.status === "running",
+        job: gabai.job
+          ? {
+              id: gabai.job.id,
+              status: gabai.job.status,
+              requested: gabai.job.requested,
+              created: gabai.job.created ?? 0,
+              failed: gabai.job.failed ?? 0,
+              startedAt: gabai.job.startedAt,
+              finishedAt: gabai.job.finishedAt ?? null,
+            }
+          : null,
+      },
+      cleverai: {
+        pool: cleveraiPool.stats(),
+        running: cleverai.job?.status === "running",
+        engine: cleveraiPool.engine,
+        appCheck: cleveraiRelay.status().appCheck,
+        job: cleverai.job
+          ? {
+              id: cleverai.job.id,
+              status: cleverai.job.status,
+              requested: cleverai.job.requested,
+              created: cleverai.job.created ?? 0,
+              failed: cleverai.job.failed ?? 0,
+              appcheck: cleverai.job.appcheck ?? null,
+              startedAt: cleverai.job.startedAt,
+              finishedAt: cleverai.job.finishedAt ?? null,
             }
           : null,
       },
@@ -1258,6 +1402,116 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       }
     }
 
+    /* ------------------------------------------------------ gabai 号池协议 */
+    // 全部挂在 /api/admin/gabai/* 与 /gab/v1/* 下，与其它线不重叠。
+    if (path === "/api/admin/gabai/status" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...gabai.status() });
+    }
+
+    if (path === "/api/admin/gabai/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...gabai.start(body) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/gabai/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...gabai.stop() });
+    }
+
+    if (path === "/api/admin/gabai/pool" && req.method === "GET") {
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      return sendJson(res, 200, {
+        ok: true,
+        schema: gabaiPool.toJSON().schema,
+        baseUrl: gabaiPool.baseUrl,
+        apiBase: gabaiPool.apiBase,
+        stats: gabaiPool.stats(),
+        accounts: gabaiPool.accounts.slice(-limit).map(maskGabaiAccount),
+      });
+    }
+
+    if (path === "/api/admin/gabai/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      const apiKey = String(body.apiKey ?? body.api_key ?? "").trim();
+      if (!email || !apiKey) {
+        return sendJson(res, 400, errorBody("需要 email 与 apiKey。", "invalid_request_error", "bad_request"));
+      }
+      const { account, created, gatewayKey } = importGabaiAccount({
+        pool: gabaiPool,
+        store,
+        record: body,
+        mintKey: body.mintKey !== false,
+      });
+      log("info", `gabai 入池 ${email}（号池 ${gabaiPool.size}）`);
+      return sendJson(res, created ? 201 : 200, {
+        ok: true,
+        created,
+        account: maskGabaiAccount(account),
+        gatewayKey: gatewayKey
+          ? { id: gatewayKey.id, label: gatewayKey.label, prefix: gatewayKey.prefix, plaintext: gatewayKey.plaintext }
+          : null,
+        pool: gabaiPool.stats(),
+      });
+    }
+
+    if (path === "/api/admin/gabai/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+        ? String(params.get("format"))
+        : "jsonl";
+      let result;
+      try {
+        result = gabai.export({ format });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (params.get("download") === "1") {
+        const payload = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "gabai-pool.jsonl";
+        res.writeHead(200, {
+          "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json",
+          "Content-Length": String(payload.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(payload);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    const gabaiMint = /^\/api\/admin\/gabai\/pool\/([^/]+)\/mint$/.exec(path);
+    if (gabaiMint && req.method === "POST") {
+      const account = gabaiPool.getAccount(gabaiMint[1]);
+      if (!account) return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      try {
+        const result = await gabaiProxy.mintApiKey(account, { name: `dcg-${new Date().toISOString().slice(0, 10)}` });
+        return sendJson(res, 200, { ok: true, ...result, account: maskGabaiAccount(gabaiPool.getAccount(account.id)) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    const gabaiDelete = /^\/api\/admin\/gabai\/pool\/([^/]+)$/.exec(path);
+    if (gabaiDelete && req.method === "DELETE") {
+      if (!gabaiPool.remove(gabaiDelete[1])) {
+        return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, { ok: true, pool: gabaiPool.stats() });
+    }
+
     if (path === "/api/admin/exchange" && req.method === "POST") {
       let body;
       try {
@@ -1489,6 +1743,11 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
           appCheck: cleveraiRelay.vault.valid(),
           credits: cleveraiPool.stats().credits,
         },
+        gabai: {
+          accounts: gabaiPool.size,
+          healthy: gabaiPool.healthy().length,
+          keys: gabaiPool.keyed().length,
+        },
         requests: stats.requests,
         streams: stats.streams,
         uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
@@ -1547,6 +1806,25 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     const limited = enforceKeyLimits(auth);
     if (limited) return sendJson(res, limited.status, limited.body, limited.headers);
+
+    // gab.ai 反代面：/gab/v1/*。上游本来就是 OpenAI / Anthropic 形状，直通，
+    // 只把 Authorization 换成号池里的 `gab_…` key，并做轮询 + 故障切换。
+    if (path === "/gab/v1/models" || path.startsWith("/gab/v1/")) {
+      const gabPath = path.slice("/gab".length);
+      if (!GAB_PATHS.has(gabPath)) {
+        return sendJson(res, 404, errorBody(`No gab route for ${path}.`, "invalid_request_error", "not_found"));
+      }
+      let body = null;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        try {
+          body = await GabaiProxy.readBody(req);
+        } catch (cause) {
+          return fail(res, cause);
+        }
+      }
+      stats.requests++;
+      return gabaiProxy.forward(req, res, gabPath, { body, headers: req.headers });
+    }
 
     // Clever AI Hub 面：/cleverai/v1/*（与 /v1/* 和 /p/* 互不重叠）
     if (path === "/cleverai" || path.startsWith("/cleverai/")) {
