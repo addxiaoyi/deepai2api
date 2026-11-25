@@ -28,3 +28,11 @@ vendor/open-webui/.venv/
 .idea/
 .DS_Store
 Thumbs.db
+# 注册机产物（含账号密码与 api_key）
+tools/deepai-reg/out/
+tools/deepai-reg/config.yaml
+
+# Python
+__pycache__/
+*.pyc
+

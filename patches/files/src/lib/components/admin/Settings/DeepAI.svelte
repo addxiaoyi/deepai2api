@@ -6,7 +6,7 @@
   connection so the models appear in the picker.
 -->
 <script lang="ts">
-	import { onMount, getContext } from 'svelte';
+	import { onMount, onDestroy, getContext } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
 	import {
@@ -18,7 +18,10 @@
 		createDeepAIKey,
 		revokeDeepAIKey,
 		deleteDeepAIKey,
-		connectDeepAIToOpenWebUI
+		connectDeepAIToOpenWebUI,
+		getDeepAIRegister,
+		startDeepAIRegister,
+		stopDeepAIRegister
 	} from '$lib/apis/deepai';
 
 	const i18n: any = getContext('i18n');
@@ -176,7 +179,104 @@
 	};
 	const isFree = (model: any) => String(model?.theos_per_request ?? '1') === '0';
 
-	onMount(load);
+	// ------------------------------------------------------------ bulk signup
+	//
+	// The gateway runs tools/deepai-reg as a child process; every account it
+	// creates is pushed back through /api/admin/accounts, so the pool below
+	// grows while this panel polls the job.
+
+	let register: any = null;
+	let registerTimer: any = null;
+	let wasRunning = false;
+
+	let regCount = 2;
+	let regConcurrency = 1;
+	let regEngine: 'auto' | 'protocol' | 'browser' = 'auto';
+	let regProvider: 'tempmail_lol' | 'mailtm' | 'imap' | 'fixed' = 'tempmail_lol';
+	let regDomains = '';
+	let regProxies = '';
+
+	const job = () => register?.job ?? null;
+	const splitTokens = (raw: string) =>
+		raw
+			.split(/[\s,;]+/)
+			.map((s) => s.trim())
+			.filter(Boolean);
+
+	async function loadRegister() {
+		try {
+			register = await getDeepAIRegister(token());
+		} catch (err: any) {
+			// A stopped gateway should not spam toasts; the panel just stays stale.
+			console.error(err);
+			return;
+		}
+		const running = register?.running === true;
+		if (running) {
+			ensurePoller();
+		} else if (wasRunning) {
+			stopPoller();
+			wasRunning = false;
+			const created = job()?.created ?? 0;
+			if (created) {
+				toast.success(`批量注册结束：新增 ${created} 个账号`);
+				await load();
+			}
+		}
+		wasRunning = running;
+	}
+
+	function ensurePoller() {
+		if (registerTimer) return;
+		registerTimer = setInterval(loadRegister, 2500);
+	}
+
+	function stopPoller() {
+		if (!registerTimer) return;
+		clearInterval(registerTimer);
+		registerTimer = null;
+	}
+
+	async function startRegister() {
+		busy = 'register';
+		try {
+			register = await startDeepAIRegister(token(), {
+				count: Number(regCount) || 1,
+				engine: regEngine,
+				concurrency: Number(regConcurrency) || 1,
+				mailProvider: regProvider,
+				mailDomains: splitTokens(regDomains),
+				proxies: splitTokens(regProxies),
+				verifyEmail: false,
+				headless: true
+			});
+			wasRunning = true;
+			ensurePoller();
+			toast.success('已开始注册，账号会自动入池');
+		} catch (err: any) {
+			toast.error(err?.message ?? '启动失败');
+		}
+		busy = '';
+	}
+
+	async function stopRegister() {
+		busy = 'register-stop';
+		try {
+			register = await stopDeepAIRegister(token());
+			stopPoller();
+			wasRunning = false;
+			toast.success('已请求停止');
+		} catch (err: any) {
+			toast.error(err?.message ?? '停止失败');
+		}
+		busy = '';
+	}
+
+	onMount(() => {
+		load();
+		loadRegister();
+	});
+	onDestroy(stopPoller);
 </script>
 
 <div class="flex flex-col gap-5 text-sm">
@@ -319,10 +419,145 @@
 		{/if}
 	</div>
 
+	<!-- bulk signup -->
+	<div class="rounded-xl border border-gray-100 p-4 dark:border-gray-800">
+		<div class="mb-1 font-medium">批量注册 · 自动入池</div>
+		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+			网关会在本机拉起 <span class="font-mono">tools/deepai-reg</span>，按邮箱域名池自动注册，
+			每个新账号的 API Key 立刻写进上面的账号池（调度器同时刷新目录，不用手动登录）。
+		</div>
+
+		<div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">数量</span>
+				<input
+					type="number"
+					min="1"
+					max="200"
+					bind:value={regCount}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				/>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">并发</span>
+				<input
+					type="number"
+					min="1"
+					max="8"
+					bind:value={regConcurrency}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				/>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">引擎</span>
+				<select
+					bind:value={regEngine}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				>
+					<option value="auto">auto（协议优先，被拦换 Camoufox）</option>
+					<option value="protocol">protocol（纯 HTTP，最快）</option>
+					<option value="browser">browser（Camoufox）</option>
+				</select>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">邮箱来源</span>
+				<select
+					bind:value={regProvider}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				>
+					<option value="tempmail_lol">tempmail.lol（免注册）</option>
+					<option value="mailtm">mail.tm</option>
+					<option value="imap">自有域名 catch-all</option>
+					<option value="fixed">固定地址 +tag</option>
+				</select>
+			</label>
+		</div>
+
+		<div class="mt-2 grid gap-2 sm:grid-cols-2">
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">
+					邮箱域名池（逗号或换行分隔；留空 = 只用自动学习到的可用域名）
+				</span>
+				<textarea
+					rows="2"
+					bind:value={regDomains}
+					placeholder="gloatinggoat.com, sablereels.com"
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 font-mono text-xs outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				></textarea>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">
+					代理池（一行一个，留空 = 用网关进程的 HTTPS_PROXY）
+				</span>
+				<textarea
+					rows="2"
+					bind:value={regProxies}
+					placeholder="http://127.0.0.1:10808"
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 font-mono text-xs outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				></textarea>
+			</label>
+		</div>
+
+		<div class="mt-3 flex flex-wrap items-center gap-2">
+			<button
+				class="rounded-lg bg-black px-3 py-1.5 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-black"
+				on:click={startRegister}
+				disabled={busy === 'register' || register?.running}
+			>
+				开始注册
+			</button>
+			{#if register?.running}
+				<button
+					class="rounded-lg px-3 py-1.5 text-sm text-red-500 ring-1 ring-red-200 disabled:opacity-50 dark:ring-red-900"
+					on:click={stopRegister}
+					disabled={busy === 'register-stop'}
+				>
+					停止
+				</button>
+			{/if}
+			{#if job()}
+				<span class="text-xs text-gray-500 dark:text-gray-400">
+					成功 {job().created ?? 0}/{job().requested ?? 0} · 入池 {job().pushed ?? 0} · 失败
+					{job().failed ?? 0} · {job().status}
+				</span>
+			{/if}
+			{#if register && register.toolPresent === false}
+				<span class="text-xs text-red-500">
+					找不到 tools/deepai-reg（可用 DEEPAI_REGISTER_DIR 指定）
+				</span>
+			{/if}
+		</div>
+
+		{#if job()?.current}
+			<div class="mt-1 font-mono text-xs text-gray-500 dark:text-gray-400">
+				当前：{job().current.email}（{job().current.domain ?? '—'}）
+			</div>
+		{/if}
+
+		{#if (job()?.lines ?? []).length > 0}
+			<pre
+				class="mt-2 max-h-48 overflow-y-auto rounded-lg bg-gray-50 p-2 font-mono text-[11px] leading-4 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{(job().lines ?? [])
+					.slice(-80)
+					.map((line: any) => `${line.at?.slice(11, 19) ?? ''} ${line.text}`)
+					.join('\n')}</pre>
+		{/if}
+
+		{#if (job()?.summary?.mail_domains ?? []).length > 0}
+			<div class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+				域名战绩：
+				{#each job().summary.mail_domains as row (row.provider + row.domain)}
+					<span class="mr-2 inline-block font-mono">
+						{row.domain} <span class="text-green-600">+{row.ok_count}</span>
+						{#if row.bad_count}<span class="text-red-500">-{row.bad_count}</span>{/if}
+					</span>
+				{/each}
+			</div>
+		{/if}
+	</div>
+
 	<!-- api keys -->
 	<div class="rounded-xl border border-gray-100 p-4 dark:border-gray-800">
-		<div class="mb-1 font-medium">API Keys</div>
-		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+		<div class="mb-1 font-medium">API Keys</div>		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
 			给 Open WebUI 和其它 OpenAI 兼容工具用。完整 Key 只在创建时显示一次（网关只存 SHA-256）。
 		</div>
 

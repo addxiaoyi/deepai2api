@@ -66,6 +66,37 @@ All require an Open WebUI **admin** session (`get_admin_user`).
 | `POST /api/v1/deepai/keys/{id}/revoke` · `DELETE /api/v1/deepai/keys/{id}` | Revoke / delete |
 | `POST /api/v1/deepai/connect` | Mint a key and register the gateway as an OpenAI connection |
 | `GET /api/v1/deepai/models` | Catalog with per-request prices |
+| `GET /api/v1/deepai/register` | Bulk-signup job: status, counters, last 80 log lines, domain scorecard |
+| `POST /api/v1/deepai/register` | Start a job (`count`, `engine`, `concurrency`, `mail_provider`, `mail_domains`, `proxies`) |
+| `POST /api/v1/deepai/register/stop` | Kill the running job (whole process tree on Windows) |
+
+## Bulk signup panel
+
+`Settings → Admin → DeepAI → 批量注册 · 自动入池` drives the gateway's
+`tools/deepai-reg` worker:
+
+```
+WebUI panel ──POST /register──▶ deepai.py ──POST /api/admin/register──▶ gateway
+                                                                        │ spawn
+                                                                        ▼
+                                              python -m deepai_reg run --json --push-url …
+                                                                        │ NDJSON events
+   panel ◀──GET /register (2.5 s poll)── deepai.py ◀──job state──────────┤
+                                                                        │
+        account pool ◀──POST /api/admin/accounts (one per new account)──┘
+```
+
+* The worker emits NDJSON on stdout (`start` / `attempt` / `account` / `log` /
+  `done`); the gateway keeps the last 240 lines and hands them to the panel.
+* Each `account` event is pushed straight back into `POST /api/admin/accounts`,
+  which calls `store.upsertAccount` and `lane.resetCatalog()` — the scheduler
+  and the model catalog refresh exactly like a manual OAuth link.
+* `mail_domains` is a rotation pool. The worker also *learns*: a domain that
+  produced an account is kept, one DeepAI refused (`Please use your own email
+  address.`) is parked in `mail_domains` inside the worker's SQLite, and the
+  next run starts from the survivors.
+* The job snapshot is persisted to `data/register-job.json`; a gateway restart
+  shows the last run as `interrupted` instead of pretending it is still going.
 
 ## Build
 

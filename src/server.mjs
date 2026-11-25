@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { chatToMessage, messagesToChat, streamAsAnthropic } from "./anthropic.mjs";
 import { extractPresentedKey, hashKey, looksLikeGatewayKey, mintKey } from "./keys.mjs";
 import { CALLBACK_PATH, SignInError, beginSignIn, exchangeCode, signInUrl, stateMatches } from "./oauth.mjs";
+import { Registrations } from "./register.mjs";
 import { publicAccount } from "./store.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024;
@@ -86,6 +87,30 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
   const aliases = parseAliases(process.env.DEEPAI_MODEL_ALIASES);
   const stats = { requests: 0, streams: 0, byModel: new Map(), startedAt: Date.now() };
   const pending = new Map(); // oauth state -> { verifier, challenge, startedAt }
+
+  /**
+   * Bulk signup: the Python worker in tools/deepai-reg creates the account and
+   * POSTs it back here, so the pool, the scheduler and the catalog all refresh
+   * exactly like a manual OAuth link does.
+   */
+  const registrations = new Registrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: (account) => {
+      const saved = store.upsertAccount({
+        apiKey: account.apiKey,
+        username: account.username,
+        isPro: account.isPro === true,
+        label: account.label,
+        connect: null,
+      });
+      lane.resetCatalog?.();
+      log("info", `注册入池 ${account.email || account.username}（账号池 ${store.accounts.length}）`);
+      return saved;
+    },
+  });
 
   const bump = (model) => {
     stats.requests++;
@@ -564,6 +589,57 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     if (path === "/api/admin/state" && req.method === "GET") return sendJson(res, 200, await adminState());
     if (path === "/api/admin/login-start" && req.method === "POST") return startSignIn(res);
+
+    /* ------------------------------------------------------------- bulk signup */
+
+    // Accepts an account created anywhere (the WebUI panel, the CLI, a script).
+    // Idempotent on apiKey, so a worker retrying a push is harmless.
+    if (path === "/api/admin/accounts" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+      if (!apiKey || apiKey.length < 16 || /[\r\n]/.test(apiKey)) {
+        return sendJson(res, 400, errorBody("apiKey 不合法。", "invalid_request_error"));
+      }
+      const saved = store.upsertAccount({
+        apiKey,
+        username: typeof body.username === "string" ? body.username : "",
+        isPro: body.isPro === true,
+        label: typeof body.label === "string" && body.label ? body.label : body.email,
+        connect: null,
+      });
+      lane.resetCatalog();
+      log("info", `账号入池 ${saved.username || saved.id}（账号池 ${store.accounts.length}）`);
+      return sendJson(res, 201, { ok: true, account: publicAccount(saved), accounts: store.accounts.length });
+    }
+
+    if (path === "/api/admin/register" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...registrations.status() });
+    }
+
+    if (path === "/api/admin/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        const snapshot = registrations.start(body);
+        return sendJson(res, 202, { ok: true, ...snapshot });
+      } catch (cause) {
+        return sendJson(res, cause.status ?? 400, errorBody(cause.message, "invalid_request_error", "register_error"));
+      }
+    }
+
+    if (path === "/api/admin/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...registrations.stop() });
+    }
+
 
     if (path === "/api/admin/exchange" && req.method === "POST") {
       let body;

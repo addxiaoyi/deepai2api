@@ -131,6 +131,19 @@ class ConnectForm(BaseModel):
     key: Optional[str] = None
 
 
+class RegisterForm(BaseModel):
+    """Bulk signup request; mirrors the gateway's POST /api/admin/register."""
+
+    count: int = 2
+    engine: str = "auto"
+    concurrency: int = 1
+    mail_provider: str = "tempmail_lol"
+    mail_domains: list[str] = []
+    proxies: list[str] = []
+    verify_email: bool = False
+    headless: bool = True
+
+
 # --------------------------------------------------------------------- routes
 
 
@@ -254,6 +267,38 @@ async def exchange_login(form_data: ExchangeForm, user=Depends(get_admin_user)):
 @router.post("/accounts/{account_id}/remove")
 async def remove_account(account_id: str, user=Depends(get_admin_user)):
     return await gw(f"/api/admin/accounts/{account_id}", method="DELETE")
+
+
+# ------------------------------------------------------------------- signup
+#
+# Bulk registration is a Python worker next to the gateway (tools/deepai-reg).
+# The gateway owns the child process; this router only starts it, reports on it
+# and can stop it. Created accounts land in the pool through /api/admin/accounts.
+
+
+@router.get("/register")
+async def register_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/register", timeout=30)
+
+
+@router.post("/register")
+async def register_start(form_data: RegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "engine": form_data.engine,
+        "concurrency": form_data.concurrency,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "proxies": form_data.proxies,
+        "verifyEmail": form_data.verify_email,
+        "headless": form_data.headless,
+    }
+    return await gw("/api/admin/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/register/stop")
+async def register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/register/stop", method="POST", timeout=30)
 
 
 # ------------------------------------------------------------------ api keys

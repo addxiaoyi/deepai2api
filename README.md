@@ -112,6 +112,55 @@ Model    : deepai-cyber
 
 ---
 
+## 3.5 批量注册（`tools/deepai-reg`）
+
+手动点授权一次一个太慢，所以另配了一台注册机：**协议引擎 + Camoufox 引擎 + 邮箱域名自动学习**，
+产出的 `apiKey` 直接 `upsertAccount` 进同一个账号池 —— 在 **Open WebUI → 设置 → Admin → DeepAI**
+的「批量注册 · 自动入池」面板里点一下就行，也可以命令行直推：
+
+```powershell
+cd tools\deepai-reg
+python -m pip install -r requirements.txt
+python -m deepai_reg doctor
+
+# WebUI 面板背后做的事，等价于：
+python -m deepai_reg run -n 5 --engine protocol --concurrency 3 --json `
+  --push-url http://127.0.0.1:8787 --push-token <网关口令>
+
+# 或事后批量灌
+node tools/deepai-reg/scripts/import-to-gateway.mjs tools/deepai-reg/out/accounts.jsonl
+```
+
+注册协议（从首页内联 JS 抠的）：`get_user_login_type` → `save_custom_signup_data`
+→ `POST api.deepai.org/daily-time-sync/registration/`（`email/username/password1/password2`）
+→ `GET api.deepai.org/daily-time-sync/user/`，新号对象里直接带 `userprofile.api_key`，
+**不需要邮箱验证，也不需要桌面端 OAuth**；`api_key` 缺失时才回落 PKCE 兑换。
+
+WebUI 侧新增三个管理接口（`deepai.py` 透传到网关）：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /api/admin/accounts` | 入池一个账号（按 apiKey 幂等），调度器与模型目录立即刷新 |
+| `GET/POST /api/admin/register` | 查询 / 启动批量注册（`count`、`engine`、`concurrency`、`mailProvider`、`mailDomains[]`、`proxies[]`） |
+| `POST /api/admin/register/stop` | 停任务（Windows 整棵进程树） |
+
+邮箱域名是**会学习的池子**：注册成功的域记 `ok_count` 下轮优先用，被 DeepAI 拒
+（`Please use your own email address.`）的域记 `bad_count` 并被停放；`mail.tm` 每轮
+还会现拉活跃域。两个免费邮箱 API 开盒都限流，所以开盒做了全局节流 + 429 退避。
+
+| 实测 | 结果 |
+| --- | --- |
+| `protocol` 3 并发 | 3/3 成功，14.7 s |
+| `protocol` 4 并发 | 4/4 成功，16.7 s（≈4 s/号） |
+| `browser`（Camoufox，无头） | 1/1 成功，43.9 s；UA `Firefox/158.0`、`webdriver=false`、时区随代理 IP |
+| 网关拉起 worker（2 并发，2 key 入池） | 2/2 成功，33.5 s，`/health` 账号数 0 → 3 |
+| 一次性域名（`mail.tm` 的 `euploading.com`） | `400 {"email": ["Please use your own email address."]}` → 自动换域 |
+| 离线用例 | `python -m unittest discover -s tests`，24/24 |
+
+细节、配置项、排错见 [`tools/deepai-reg/README.md`](tools/deepai-reg/README.md)。
+
+---
+
 ## 4. OpenWebUI 二次开发（fork）
 
 `vendor/open-webui` = **Open WebUI 0.13.4 上游 + DeepAI provider**。
@@ -186,6 +235,7 @@ tests/
 scripts/
   openwebui.ps1   构建/启动 fork
   screenshot.mjs  headless Chrome 截图 + 渲染后 DOM 快照
+tools/deepai-reg/ 批量注册机（协议引擎 + Camoufox，产物灌进 accounts[]）
 docker-compose.yml  overlay 镜像（官方 v0.13.4 + 我们的后端/前端文件）
 scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 ```

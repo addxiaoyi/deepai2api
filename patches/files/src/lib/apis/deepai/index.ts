@@ -73,3 +73,36 @@ export const connectDeepAIToOpenWebUI = async (token: string = '', key: string |
 	request(token, '/connect', { method: 'POST', body: JSON.stringify({ key }) });
 
 export const listDeepAIModels = async (token: string = '') => request(token, '/models');
+
+// ---------------------------------------------------------------- bulk signup
+
+export type RegisterOptions = {
+	count: number;
+	engine: 'auto' | 'protocol' | 'browser';
+	concurrency: number;
+	mailProvider: 'tempmail_lol' | 'mailtm' | 'imap' | 'fixed';
+	mailDomains: string[];
+	proxies: string[];
+	verifyEmail: boolean;
+	headless: boolean;
+};
+
+export const getDeepAIRegister = async (token: string = '') => request(token, '/register');
+
+export const startDeepAIRegister = async (token: string = '', options: RegisterOptions) =>
+	request(token, '/register', {
+		method: 'POST',
+		body: JSON.stringify({
+			count: options.count,
+			engine: options.engine,
+			concurrency: options.concurrency,
+			mail_provider: options.mailProvider,
+			mail_domains: options.mailDomains,
+			proxies: options.proxies,
+			verify_email: options.verifyEmail,
+			headless: options.headless
+		})
+	});
+
+export const stopDeepAIRegister = async (token: string = '') =>
+	request(token, '/register/stop', { method: 'POST' });
