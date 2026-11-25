@@ -14,6 +14,10 @@ import { chatToMessage, messagesToChat, streamAsAnthropic } from "./anthropic.mj
 import { extractPresentedKey, hashKey, looksLikeGatewayKey, mintKey } from "./keys.mjs";
 import { CALLBACK_PATH, SignInError, beginSignIn, exchangeCode, signInUrl, stateMatches } from "./oauth.mjs";
 import { Registrations } from "./register.mjs";
+import { AllmodelsPool, importAccount, maskAccount } from "./allmodels-pool.mjs";
+import { AllmodelsRegistrations } from "./allmodels-register.mjs";
+import { ToolError, createToolRegistry } from "./allmodels-tools.mjs";
+import { PoePool } from "./poe-pool.mjs";
 import { publicAccount } from "./store.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024;
@@ -112,6 +116,64 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     },
   });
 
+  /**
+   * Allmodels 号池：accounts registered on dash.allmodels.io, each with the
+   * dashboard API key it produced and a gateway key minted for it. The pool file
+   * is the shared protocol (`docs/ALLMODELS-POOL.md`); the controller below is
+   * the only writer while a batch is running.
+   */
+  const allmodelsPool = AllmodelsPool.at(config.dataDir, {
+    baseUrl: process.env.ALLMODELS_BASE_URL || "https://dash.allmodels.io",
+    apiBase: process.env.ALLMODELS_API_BASE || "https://api.allmodels.io/v1",
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
+  const allmodels = new AllmodelsRegistrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    pool: allmodelsPool,
+    store,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account, gatewayKey }) => {
+      log(
+        "info",
+        `allmodels 入池 ${account.email}（号池 ${allmodelsPool.size}，网关 Key ${gatewayKey?.prefix ?? "-"}）`,
+      );
+    },
+  });
+
+  // 工具层：MCP（src/allmodels-mcp.mjs）与 HTTP 桥共用同一份 schema + handler。
+  const allmodelsTools = createToolRegistry({
+    pool: allmodelsPool,
+    store,
+    registrations: allmodels,
+    config,
+    log,
+  });
+
+  /**
+   * Poe 号池：和 DeepAI 池并行但完全独立 —— 凭据是 p-b cookie，不是 api key，
+   * 生命周期也不同（email_verified → phone_required → active）。写入口有两处：
+   * worker 注册完自己 POST /api/poe/accounts，或操作者手动补登。
+   */
+  const poePool = new PoePool(config.dataDir);
+  const poe = new Registrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    spec: {
+      name: "poe",
+      module: "poe_reg",
+      jobFile: "poe-register-job.json",
+      retryFlag: false,
+      smsFlag: true,
+      mapAccount: null,
+    },
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: () => {},
+  });
+
   const bump = (model) => {
     stats.requests++;
     stats.byModel.set(model, (stats.byModel.get(model) ?? 0) + 1);
@@ -160,7 +222,14 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     if (presented) {
       if (sameSecret(presented, adminToken) || sameSecret(presented, config.token)) return { ok: true, kind: "admin" };
       if (!looksLikeGatewayKey(presented)) return { ok: false, reason: "format" };
-      const key = store.findByHash(hashKey(presented));
+      const hash = hashKey(presented);
+      let key = store.findByHash(hash);
+      if (!key) {
+        // A key minted by the MCP server / CLI lands in the same state file;
+        // pick it up before calling this credential unknown.
+        store.reloadFromDisk();
+        key = store.findByHash(hash);
+      }
       if (!key) return { ok: false, reason: "unknown" };
       return { ok: true, kind: "key", keyId: key.id };
     }
@@ -544,6 +613,9 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
   /* ------------------------------------------------------------- admin state */
 
   async function adminState() {
+    // 号池 / Key 可能被 MCP server 或 CLI 改过，面板要看到最新的一份。
+    store.reloadFromDisk();
+    allmodelsPool.reload();
     const models = await lane.getCatalog().catch(() => []);
     const primary = store.account;
     const usage = primary ? await lane.getAllowance(primary).catch(() => null) : null;
@@ -556,6 +628,21 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       usage,
       lane: lane.base.replace(/\/deepai_code$/, ""),
       scheduler: scheduler.status(),
+      allmodels: {
+        pool: allmodelsPool.stats(),
+        running: allmodels.job?.status === "running",
+        job: allmodels.job
+          ? {
+              id: allmodels.job.id,
+              status: allmodels.job.status,
+              requested: allmodels.job.requested,
+              created: allmodels.job.created ?? 0,
+              failed: allmodels.job.failed ?? 0,
+              startedAt: allmodels.job.startedAt,
+              finishedAt: allmodels.job.finishedAt ?? null,
+            }
+          : null,
+      },
       stats: {
         requests: stats.requests,
         streams: stats.streams,
@@ -566,6 +653,7 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
   }
 
   async function handleAdmin(req, res, path) {
+    const params = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`).searchParams;
     if (path === "/api/admin/login" && req.method === "POST") {
       let body;
       try {
@@ -621,6 +709,36 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       return sendJson(res, 200, { ok: true, ...registrations.status() });
     }
 
+    // Filtered log tail for the panel; `download=1` streams it as a .log file.
+    if (path === "/api/admin/register/log" && req.method === "GET") {
+      const params = new URL(req.url ?? "/", "http://127.0.0.1").searchParams;
+      const level = ["debug", "info", "warn", "error"].includes(params.get("level"))
+        ? params.get("level")
+        : "";
+      if (params.get("download") === "1") {
+        const body = Buffer.from(registrations.logText({ level }), "utf8");
+        res.writeHead(200, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(body.length),
+          "Content-Disposition": `attachment; filename="deepai-register-${level || "all"}.log"`,
+          "Cache-Control": "no-store",
+        });
+        res.end(body);
+        return;
+      }
+      const limit = Number(params.get("limit") ?? 120);
+      return sendJson(res, 200, {
+        ok: true,
+        level: level || "all",
+        lines: registrations.logSlice({ level, limit }),
+      });
+    }
+
+    if (path === "/api/admin/register/domains" && req.method === "GET") {
+      const params = new URL(req.url ?? "/", "http://127.0.0.1").searchParams;
+      return sendJson(res, 200, registrations.domains({ force: params.get("force") === "1" }));
+    }
+
     if (path === "/api/admin/register" && req.method === "POST") {
       let body = {};
       try {
@@ -638,6 +756,175 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     if (path === "/api/admin/register/stop" && req.method === "POST") {
       return sendJson(res, 200, { ok: true, ...registrations.stop() });
+    }
+
+    /* --------------------------------------------------- allmodels 号池协议 */
+
+    // Everything below speaks the pool protocol in docs/ALLMODELS-POOL.md:
+    // register a batch, import an account the worker created elsewhere, inspect
+    // or mask the pool, and export accounts + keys in one file.
+
+    if (path === "/api/admin/allmodels/status" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...allmodels.status() });
+    }
+
+    // 给"编程工具 / 插件 / 工作流"的 HTTP 入口：列工具、按名字调用。
+    if (path === "/api/admin/allmodels/tools" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, tools: allmodelsTools.list(), openai: allmodelsTools.openai() });
+    }
+
+    const toolCall = /^\/api\/admin\/allmodels\/tools\/([A-Za-z0-9_]+)$/.exec(path);
+    if (toolCall && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const args =
+        body && typeof body === "object" && body.arguments && typeof body.arguments === "object"
+          ? body.arguments
+          : (body ?? {});
+      try {
+        const result = await allmodelsTools.call(toolCall[1], args);
+        return sendJson(res, 200, { ok: true, tool: toolCall[1], result });
+      } catch (cause) {
+        return sendJson(
+          res,
+          cause instanceof ToolError ? 400 : 502,
+          errorBody(cause.message, "invalid_request_error", cause.code ?? "tool_failed"),
+        );
+      }
+    }
+
+    if (path === "/api/admin/allmodels/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...allmodels.start(body) });
+      } catch (cause) {
+        return sendJson(res, cause.status ?? 400, errorBody(cause.message, "invalid_request_error", "register_error"));
+      }
+    }
+
+    if (path === "/api/admin/allmodels/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...allmodels.stop() });
+    }
+
+    if (path === "/api/admin/allmodels/pool" && req.method === "GET") {
+      allmodelsPool.reload();
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      const rows = allmodelsPool.accounts.slice(-limit).map(maskAccount);
+      return sendJson(res, 200, {
+        ok: true,
+        schema: allmodelsPool.toJSON().schema,
+        baseUrl: allmodelsPool.baseUrl,
+        apiBase: allmodelsPool.apiBase,
+        updatedAt: allmodelsPool.toJSON().updatedAt,
+        stats: allmodelsPool.stats(),
+        accounts: rows,
+      });
+    }
+
+    // The worker's push target, and the manual import path. Idempotent on apiKey.
+    if (path === "/api/admin/allmodels/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+      const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+      if (!apiKey || apiKey.length < 16 || /[\r\n]/.test(apiKey)) {
+        return sendJson(res, 400, errorBody("apiKey 不合法。", "invalid_request_error", "bad_api_key"));
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return sendJson(res, 400, errorBody("email 不合法。", "invalid_request_error", "bad_email"));
+      }
+      const result = importAccount({
+        pool: allmodelsPool,
+        store,
+        record: { ...body, apiKey, email },
+        mintKey: body.mintKey !== false,
+      });
+      log("info", `allmodels 入池 ${email}（号池 ${allmodelsPool.size}）`);
+      return sendJson(res, 201, {
+        ok: true,
+        created: result.created,
+        account: maskAccount(result.account),
+        gatewayKey: result.gatewayKey
+          ? { id: result.gatewayKey.id, prefix: result.gatewayKey.prefix, label: result.gatewayKey.label }
+          : null,
+        pool: allmodelsPool.stats(),
+      });
+    }
+
+    if (path === "/api/admin/allmodels/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["jsonl", "csv", "pool"].includes(params.get("format"))
+        ? params.get("format")
+        : "jsonl";
+      const download = params.get("download") === "1";
+      const result = allmodels.export({ format });
+      if (download) {
+        const body = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "allmodels-pool.jsonl";
+        res.writeHead(200, {
+          "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8",
+          "Content-Length": String(body.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        res.end(body);
+        return;
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    const poolHealth = /^\/api\/admin\/allmodels\/pool\/([^/]+)\/health$/.exec(path);
+    if (poolHealth && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const updated = allmodelsPool.recordResult(poolHealth[1], {
+        ok: body.ok !== false,
+        error: body.error ?? null,
+        cooldownMs: Number(body.cooldownMs ?? 0),
+      });
+      if (!updated) return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      return sendJson(res, 200, { ok: true, account: maskAccount(updated), pool: allmodelsPool.stats() });
+    }
+
+    const poolDelete = /^\/api\/admin\/allmodels\/pool\/([^/]+)$/.exec(path);
+    if (poolDelete && req.method === "DELETE") {
+      if (!allmodelsPool.remove(poolDelete[1])) {
+        return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, { ok: true, pool: allmodelsPool.stats() });
+    }
+
+    if (path === "/api/admin/allmodels/keys" && req.method === "GET") {
+      allmodelsPool.reload();
+      return sendJson(res, 200, {
+        ok: true,
+        keys: allmodelsPool.accounts.map((account) => ({
+          email: account.email,
+          keyPrefix: account.keyPrefix,
+          keyLast4: account.keyLast4,
+          keySource: account.keySource,
+          status: account.status,
+          gatewayKey: account.gatewayKey
+            ? { id: account.gatewayKey.id, label: account.gatewayKey.label, prefix: account.gatewayKey.prefix }
+            : null,
+        })),
+      });
     }
 
 
@@ -698,6 +985,109 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       return sendJson(res, 200, await adminState());
     }
 
+    /* --------------------------------------------------------------- poe 号池 */
+
+    if (path === "/api/poe/accounts" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        accounts: poePool.list(Number(new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("limit") ?? 100)),
+        counts: poePool.counts(),
+      });
+    }
+
+    // Write entry used by the worker's `--push-url`, and by the WebUI's manual add.
+    if (path === "/api/poe/accounts" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        const { created, account } = poePool.upsert(body);
+        poePool.flush();
+        log("info", `poe 入池 ${account.email}（${account.status}，号池 ${poePool.accounts.length}）`);
+        return sendJson(res, created ? 201 : 200, {
+          ok: true,
+          created,
+          account: PoePool.public(account),
+          counts: poePool.counts(),
+        });
+      } catch (cause) {
+        return sendJson(res, 400, errorBody(cause.message, "invalid_request_error"));
+      }
+    }
+
+    const poeAccount = /^\/api\/poe\/accounts\/([^/]+)$/.exec(path);
+    if (poeAccount && req.method === "DELETE") {
+      if (!poePool.remove(poeAccount[1])) return sendJson(res, 404, errorBody("账号不存在。", "invalid_request_error"));
+      poePool.flush();
+      return sendJson(res, 200, { ok: true, counts: poePool.counts() });
+    }
+
+    if (path === "/api/poe/accounts/status" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (!poePool.mark(body.email, body.status)) {
+        return sendJson(res, 404, errorBody("账号不存在或状态非法。", "invalid_request_error"));
+      }
+      poePool.flush();
+      return sendJson(res, 200, { ok: true, counts: poePool.counts() });
+    }
+
+    if (path === "/api/poe/health" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, counts: poePool.counts(), total: poePool.accounts.length });
+    }
+
+    if (path === "/api/poe/register" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...poe.status() });
+    }
+
+    if (path === "/api/poe/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...poe.start(body) });
+      } catch (cause) {
+        return sendJson(res, cause.status ?? 400, errorBody(cause.message, "invalid_request_error", "register_error"));
+      }
+    }
+
+    if (path === "/api/poe/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...poe.stop() });
+    }
+
+    if (path === "/api/poe/register/log" && req.method === "GET") {
+      const params = new URL(req.url ?? "/", "http://127.0.0.1").searchParams;
+      const level = ["debug", "info", "warn", "error"].includes(params.get("level"))
+        ? params.get("level")
+        : "";
+      if (params.get("download") === "1") {
+        const body = Buffer.from(poe.logText({ level }), "utf8");
+        res.writeHead(200, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(body.length),
+          "Content-Disposition": `attachment; filename="poe-register-${level || "all"}.log"`,
+          "Cache-Control": "no-store",
+        });
+        res.end(body);
+        return;
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        level: level || "all",
+        lines: poe.logSlice({ level, limit: Number(params.get("limit") ?? 120) }),
+      });
+    }
+
     return sendJson(res, 404, errorBody(`No admin route for ${req.method} ${path}.`, "invalid_request_error", "not_found"));
   }
 
@@ -752,16 +1142,22 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
         accounts: store.accounts.length,
         healthy_accounts: scheduler.candidates({}).length,
         keys: store.listKeys().filter((k) => !k.revoked).length,
+        poe: { total: poePool.accounts.length, ...poePool.counts() },
         lane: lane.base,
         instance: lane.instance,
         check_in: primary ? lane.checkInFor(primary.id) : null,
+        allmodels: {
+          accounts: allmodelsPool.size,
+          healthy: allmodelsPool.healthy().length,
+          keys: allmodelsPool.accounts.filter((a) => a.gatewayKey).length,
+        },
         requests: stats.requests,
         streams: stats.streams,
         uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
       });
     }
 
-    if (path.startsWith("/api/admin/")) return handleAdmin(req, res, path);
+    if (path.startsWith("/api/admin/") || path.startsWith("/api/poe/")) return handleAdmin(req, res, path);
 
     // ---- authenticated surfaces ----
     const auth = authorizeApi(req, url);
@@ -865,7 +1261,7 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       });
   });
 
-  return { server, adminToken };
+  return { server, adminToken, allmodels, allmodelsPool };
 }
 
 /**

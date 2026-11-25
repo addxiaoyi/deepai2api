@@ -8,7 +8,10 @@
   "scripts": {
     "start": "node src/index.mjs",
     "models": "node src/index.mjs --list-models",
-    "smoke": "node tests/smoke.mjs"
+    "smoke": "node tests/smoke.mjs",
+    "allmodels": "node src/allmodels-cli.mjs",
+    "mcp": "node src/allmodels-mcp.mjs",
+    "test:allmodels": "node --test tests/allmodels-pool.test.mjs tests/allmodels-concurrency.test.mjs tests/allmodels-mcp.test.mjs && node tests/allmodels-e2e.mjs"
   },
   "engines": { "node": ">=20" },
   "dependencies": { "undici": "^7.0.0" }

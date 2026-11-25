@@ -1,0 +1,7 @@
+httpx>=0.27
+PyYAML>=6.0
+pytest>=8.0
+# 指纹浏览器引擎（至少装一个；auto 会按 camoufox > patchright > playwright 选）
+# camoufox[geoip]>=0.4      # Firefox + C++ 指纹改写，Turnstile 托管挑战通过率最高
+# patchright>=1.40          # Playwright 反检测分支（Chromium）
+# playwright>=1.45          # 兜底；装完还要 playwright install chromium

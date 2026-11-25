@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "allmodels": {
+      "command": "node",
+      "args": ["src/allmodels-mcp.mjs"],
+      "env": {}
+    }
+  }
+}

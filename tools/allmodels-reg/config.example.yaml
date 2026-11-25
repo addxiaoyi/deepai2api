@@ -1,0 +1,57 @@
+# 复制为 config.yaml 后修改；所有字段都有默认值，只填你要覆盖的
+base_url: https://dash.allmodels.io
+
+# 注册引擎：protocol 纯协议 / browser 指纹浏览器 / auto 协议优先、被 Turnstile 拦住自动切浏览器
+engine: auto
+
+count: 1
+concurrency: 2            # 并发注册数；建议不超过代理数量
+attempts: 3               # 单个账号的最大尝试次数
+retry_rounds: 1           # 首轮失败后再整体重跑一次
+delay: [4, 9]             # 两次尝试之间的随机等待（秒）
+timeout: 45
+language: en-US
+user_agent: ""            # 留空则按 Chrome 生成
+
+verify_email: true        # 轮询邮箱点验证链接
+keys_per_account: 1       # 每个账号创建几个面板 Key（1 = 用注册时下发的那把）
+key_name_template: "{local}-{date}"
+
+proxies: []               # ["http://user:pass@host:port", "socks5://host:port"]
+proxy_rotate: true
+
+output_dir: out           # sqlite / jsonl / csv / run.log 都写在这里
+# db_path: out/accounts.sqlite3
+
+mail:
+  provider: tempmail_lol  # tempmail_lol | mailtm | imap | fixed
+  domain: ""
+  domains: []             # 域名轮换池
+  address: ""             # provider=fixed: 你自己的地址（自动 plus 分号）
+  prefix: ""              # imap: 本地部分前缀
+  imap_host: ""
+  imap_port: 993
+  imap_user: ""
+  imap_password: ""
+  verify_timeout: 180
+  verify_pattern: 'https?://[^\s"''<>]+'
+
+captcha:
+  provider: none          # none | capsolver | 2captcha | browser | manual
+  api_key: ""             # 解题平台 key；manual 模式下就是 token 本身
+  action: signup
+  timeout: 150
+  poll: 3
+
+browser:
+  stack: auto             # auto | camoufox | patchright | playwright
+  headless: true          # 想看过程就 --headful
+  cdp: ""                 # 接管外部指纹浏览器，如 http://127.0.0.1:50325
+  humanize: 1.0           # 打字/移动/停顿倍率
+  geoip: true             # 时区/语言跟随代理出口
+  turnstile_timeout: 50
+  screenshots: true       # 失败截图落在 output_dir/screenshots
+  profile_dir: ""         # 留空 = 每个账号全新上下文（推荐）
+
+push_url: ""              # 例如 http://127.0.0.1:8787
+push_token: ""            # 网关管理口令

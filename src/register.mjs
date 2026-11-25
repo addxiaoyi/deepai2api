@@ -23,17 +23,33 @@ const clampInt = (value, fallback, min, max) => {
 };
 
 export class Registrations {
-  constructor({ dataDir, port, token, onAccount, log = () => {} }) {
+  constructor({ dataDir, port, token, onAccount, log = () => {}, spec = {} }) {
     this.dataDir = dataDir;
     this.port = port;
     this.token = token;
     this.onAccount = onAccount;
     this.log = log;
-    this.statePath = join(dataDir, "register-job.json");
-    this.toolDir = process.env.DEEPAI_REGISTER_DIR || join(repoRoot, "tools", "deepai-reg");
-    this.python = process.env.DEEPAI_PYTHON || (process.platform === "win32" ? "python" : "python3");
+    // One class drives both factories; only the wiring differs.
+    const toolName = spec.name === "poe" ? "poe-reg" : "deepai-reg";
+    this.spec = {
+      name: "deepai",
+      module: "deepai_reg",
+      jobFile: "register-job.json",
+      retryFlag: true,
+      smsFlag: false,
+      mapAccount: defaultMapAccount,
+      ...spec,
+    };
+    this.statePath = join(dataDir, this.spec.jobFile);
+    this.toolDir =
+      process.env.DEEPAI_REGISTER_DIR ||
+      (this.spec.name === "poe" ? process.env.POE_REGISTER_DIR : "") ||
+      join(repoRoot, "tools", toolName);
+    this.python = process.env.DEEPAI_PYTHON || process.env.POE_PYTHON || (process.platform === "win32" ? "python" : "python3");
     this.job = null;
     this.child = null;
+    this._domainsCache = null;
+    this._domainsAt = 0;
     this._restore();
   }
 
@@ -66,7 +82,8 @@ export class Registrations {
 
   _line(level, text) {
     if (!this.job) return;
-    this.job.lines.push({ at: new Date().toISOString(), level, text: String(text).slice(0, 400) });
+    const lvl = ["debug", "info", "warn", "error"].includes(level) ? level : "info";
+    this.job.lines.push({ at: new Date().toISOString(), level: lvl, text: String(text).slice(0, 400) });
     if (this.job.lines.length > MAX_LINES) this.job.lines.splice(0, this.job.lines.length - MAX_LINES);
   }
 
@@ -79,26 +96,47 @@ export class Registrations {
       case "start":
         this.job.engine = event.engine ?? this.job.engine;
         this.job.mailProvider = event.mail_provider ?? this.job.mailProvider;
+        this.job.retryRounds = Number(event.retry_rounds ?? 0);
         this._line("info", `worker 启动：${event.engine} × ${event.count}，邮箱 ${event.mail_provider}`);
         break;
       case "attempt":
         this.job.current = { email: event.email, domain: event.domain, provider: event.provider };
         this.job.attempts = (this.job.attempts ?? 0) + 1;
         break;
+      case "retry":
+        this.job.retryRound = event.round ?? 0;
+        this.job.retrying = event.count ?? 0;
+        this._line("warn", `第 ${event.round} 轮重试：${event.count} 个账号`);
+        break;
+      case "failed": {
+        this.job.failedEvents = (this.job.failedEvents ?? 0) + 1;
+        const kind = event.kind || "error";
+        this.job.failureReasons = this.job.failureReasons ?? {};
+        const row = (this.job.failureReasons[kind] = this.job.failureReasons[kind] ?? {
+          count: 0,
+          example: "",
+        });
+        row.count += 1;
+        if (!row.example) row.example = String(event.reason ?? "").slice(0, 160);
+        const round = Number(event.round ?? 0);
+        if (round >= (this.job.retryRounds ?? 0)) this.job.settled = (this.job.settled ?? 0) + 1;
+        this._line("error", `${event.email || "?"} 失败（${kind}）：${event.reason ?? ""}`);
+        break;
+      }
       case "account": {
         const account = event.account ?? {};
         this.job.created = (this.job.created ?? 0) + 1;
+        this.job.settled = (this.job.settled ?? 0) + 1;
         this.job.domains = mergeDomain(this.job.domains, event.domain, true);
-        this._line("info", `+ ${account.email} (${event.engine})`);
+        this._line("info", `+ ${account.email || account.username} (${event.engine})`);
         try {
-          this.onAccount?.({
-            apiKey: account.api_key,
-            username: account.username || account.email,
-            isPro: account.is_pro === true,
-            email: account.email,
-            label: account.email,
-          });
-          this.job.pushed = (this.job.pushed ?? 0) + 1;
+          const mapped = this.spec.mapAccount
+            ? this.spec.mapAccount(account, event)
+            : null;
+          if (mapped) {
+            this.onAccount?.(mapped);
+            this.job.pushed = (this.job.pushed ?? 0) + 1;
+          }
         } catch (error) {
           this._line("error", `入池失败 ${account.email}: ${error.message}`);
           this.job.pushFailed = (this.job.pushFailed ?? 0) + 1;
@@ -109,12 +147,13 @@ export class Registrations {
         this.job.summary = event.summary ?? null;
         this.job.created = event.summary?.created ?? this.job.created;
         this.job.failed = event.summary?.failed ?? this.job.failed;
+        this.job.settled = (this.job.created ?? 0) + (this.job.failed ?? 0);
         if (Array.isArray(event.summary?.mail_domains)) {
           this.job.domainStats = event.summary.mail_domains;
         }
         this._line(
           "info",
-          `完成：成功 ${this.job.created ?? 0}，失败 ${this.job.failed ?? 0}，用时 ${event.summary?.seconds ?? "?"}s`,
+          `完成：成功 ${this.job.created ?? 0}，失败 ${this.job.failed ?? 0}，重试 ${event.summary?.retries ?? 0} 个，用时 ${event.summary?.seconds ?? "?"}s`,
         );
         break;
       case "push_error":
@@ -136,17 +175,81 @@ export class Registrations {
         job: null,
         python: this.python,
         toolDir: this.toolDir,
-        toolPresent: existsSync(join(this.toolDir, "deepai_reg", "cli.py")),
+        toolPresent: existsSync(join(this.toolDir, this.spec.module, "cli.py")),
       };
     }
+    const job = this.job;
+    const startedMs = Date.parse(job.startedAt || "") || Date.now();
+    const endMs = job.finishedAt ? Date.parse(job.finishedAt) : Date.now();
+    const elapsedSeconds = Math.max(0.1, (endMs - startedMs) / 1000);
+    const requested = Number(job.requested ?? 0);
+    const settled =
+      job.status === "running" ? Number(job.settled ?? job.created ?? 0) : Number(job.created ?? 0) + Number(job.failed ?? 0);
+    const rate = settled / elapsedSeconds;
+    const remaining = Math.max(0, requested - settled);
+    job.progress = {
+      settled,
+      requested,
+      ratio: requested ? Math.min(1, settled / requested) : 0,
+      elapsedSeconds: Math.round(elapsedSeconds),
+      ratePerMinute: Math.round(rate * 600) / 10,
+      etaSeconds: job.status === "running" ? (rate > 0 ? Math.round(remaining / rate) : null) : 0,
+    };
     return {
       ok: true,
-      running: this.job.status === "running",
-      job: this.job,
+      running: job.status === "running",
+      job,
       python: this.python,
       toolDir: this.toolDir,
-      toolPresent: existsSync(join(this.toolDir, "deepai_reg", "cli.py")),
+      toolPresent: existsSync(join(this.toolDir, this.spec.module, "cli.py")),
     };
+  }
+
+  /** Job log, optionally filtered by level, for the panel and for downloads. */
+  logSlice({ level = "", limit = 120 } = {}) {
+    const lines = this.job?.lines ?? [];
+    const filtered = level ? lines.filter((line) => line.level === level) : lines;
+    return filtered.slice(-Math.max(1, Math.min(240, Number(limit) || 120)));
+  }
+
+  logText({ level = "" } = {}) {
+    const lines = this.job?.lines ?? [];
+    const filtered = level ? lines.filter((line) => line.level === level) : lines;
+    const header = `# deepai-reg job ${this.job?.id ?? "none"} status=${this.job?.status ?? "none"} level=${level || "all"}\n`;
+    return (
+      header +
+      filtered
+        .map((line) => `${line.at} ${String(line.level).toUpperCase().padEnd(5)} ${line.text}`)
+        .join("\n") +
+      "\n"
+    );
+  }
+
+  /** Domain scorecard straight from the worker's SQLite (cached for 30 s). */
+  domains({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && this._domainsCache && now - this._domainsAt < 30_000) return this._domainsCache;
+    let rows = [];
+    try {
+      const result = spawnSync(this.python, ["-m", this.spec.module, "domains", "--json"], {
+        cwd: this.toolDir,
+        timeout: 25_000,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
+        windowsHide: true,
+      });
+      if (result.status === 0 && result.stdout) {
+        const parsed = JSON.parse(result.stdout.trim().split(/\r?\n/).pop() ?? "{}");
+        rows = Array.isArray(parsed.domains) ? parsed.domains : [];
+      }
+    } catch (error) {
+      this.log("warn", `register: domains probe failed: ${error.message}`);
+    }
+    if (!rows.length && Array.isArray(this.job?.domainStats)) rows = this.job.domainStats;
+    const payload = { ok: true, domains: rows, source: rows.length ? "worker" : "job", at: new Date().toISOString() };
+    this._domainsCache = payload;
+    this._domainsAt = now;
+    return payload;
   }
 
   start(options = {}) {
@@ -160,7 +263,7 @@ export class Registrations {
       error.status = 400;
       throw error;
     }
-    if (!existsSync(join(this.toolDir, "deepai_reg", "cli.py"))) {
+    if (!existsSync(join(this.toolDir, this.spec.module, "cli.py"))) {
       const error = new Error(`找不到注册工具：${this.toolDir}（可用 DEEPAI_REGISTER_DIR 指定）`);
       error.status = 400;
       throw error;
@@ -181,7 +284,7 @@ export class Registrations {
 
     const args = [
       "-m",
-      "deepai_reg",
+      this.spec.module,
       "run",
       "--json",
       "-n",
@@ -199,8 +302,11 @@ export class Registrations {
     ];
     for (const domain of mailDomains) args.push("--mail-domains", domain);
     for (const proxy of proxies) args.push("--proxy", proxy);
-    if (options.verifyEmail === false) args.push("--no-verify");
+    if (options.verifyEmail === false && this.spec.name === "deepai") args.push("--no-verify");
     if (options.headless === false) args.push("--headful");
+    const retryRounds = clampInt(options.retryRounds, 1, 0, 3);
+    if (this.spec.retryFlag) args.push("--retry-rounds", String(retryRounds));
+    if (this.spec.smsFlag && options.smsProvider) args.push("--sms-provider", String(options.smsProvider));
 
     this.job = {
       id: `reg-${Date.now().toString(36)}`,
@@ -210,8 +316,13 @@ export class Registrations {
       requested: count,
       created: 0,
       failed: 0,
+      settled: 0,
       pushed: 0,
       attempts: 0,
+      failedEvents: 0,
+      retryRounds,
+      retryRound: 0,
+      failureReasons: {},
       engine,
       concurrency,
       mailProvider,
@@ -314,4 +425,15 @@ function mergeDomain(list, domain, ok) {
   if (found) return out;
   out.push({ domain, ok });
   return out.slice(-40);
+}
+
+
+function defaultMapAccount(account) {
+  return {
+    apiKey: account.api_key,
+    username: account.username || account.email,
+    isPro: account.is_pro === true,
+    email: account.email,
+    label: account.email,
+  };
 }

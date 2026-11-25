@@ -1,0 +1,267 @@
+"""Config loading: YAML file + env + CLI overrides, with sane defaults."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+DEFAULT_CONFIG_FILES = ("config.yaml", "config.example.yaml")
+
+# A pool entry may be "http://user:pass@host:port", "socks5://host:port", or bare "host:port".
+_SCHEME_DEFAULT = "http"
+DEFAULT_BASE = "https://dash.allmodels.io"
+
+
+def normalize_proxy(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"{_SCHEME_DEFAULT}://{value}"
+    return value
+
+
+def env_proxy() -> str:
+    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return normalize_proxy(raw)
+    return ""
+
+
+@dataclass(slots=True)
+class MailConfig:
+    """Where the signup address comes from."""
+
+    provider: str = "tempmail_lol"  # tempmail_lol | mailtm | imap | fixed
+    domain: str = ""
+    domains: list[str] = field(default_factory=list)
+    address: str = ""               # provider=fixed: reuse one address (plus-addressing)
+    prefix: str = ""                # imap: local part prefix
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_user: str = ""
+    imap_password: str = ""
+    verify_timeout: float = 180.0
+    verify_pattern: str = r"https?://[^\s\"'<>]+"
+
+
+@dataclass(slots=True)
+class CaptchaConfig:
+    """Turnstile tokens for `POST /api/auth/sign-up/email`."""
+
+    provider: str = "none"          # none | capsolver | 2captcha | browser | manual
+    api_key: str = ""
+    action: str = "signup"
+    timeout: float = 150.0
+    poll: float = 3.0
+
+
+@dataclass(slots=True)
+class BrowserConfig:
+    """指纹浏览器引擎（协议被 Turnstile/CF 拦截时的第二条腿）。"""
+
+    stack: str = "auto"          # auto | camoufox | patchright | playwright
+    headless: bool = True
+    cdp: str = ""                # 外部指纹浏览器的 CDP 地址，如 http://127.0.0.1:50325
+    humanize: float = 1.0        # 打字/移动/停顿的倍率
+    geoip: bool = True           # 时区/语言跟随代理出口
+    turnstile_timeout: float = 50.0
+    screenshots: bool = True
+    profile_dir: str = ""        # 留空 = 每次全新上下文（推荐）
+
+
+@dataclass(slots=True)
+class Config:
+    base_url: str = DEFAULT_BASE
+    engine: str = "auto"            # protocol | browser | auto
+    count: int = 1
+    concurrency: int = 2
+    attempts: int = 3
+    retry_rounds: int = 1
+    delay: tuple[float, float] = (4.0, 9.0)
+    timeout: float = 45.0
+    language: str = "en-US"
+    user_agent: str = ""
+    verify_email: bool = True
+    keys_per_account: int = 1
+    key_name_template: str = "{local}-{date}"
+    proxies: list[str] = field(default_factory=list)
+    proxy_rotate: bool = True
+    output_dir: Path = Path("out")
+    db_path: Path | None = None
+    mail: MailConfig = field(default_factory=MailConfig)
+    captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    browser: BrowserConfig = field(default_factory=BrowserConfig)
+    push_url: str = ""
+    push_token: str = ""
+    gateway_pool_file: str = ""
+
+    # ---------------------------------------------------------------- loading
+    @classmethod
+    def load(cls, path: str | Path | None = None, overrides: dict[str, Any] | None = None) -> "Config":
+        data: dict[str, Any] = {}
+        chosen = Path(path) if path else cls._discover()
+        if chosen and chosen.exists():
+            data = yaml.safe_load(chosen.read_text(encoding="utf-8")) or {}
+            data.setdefault("__source__", str(chosen))
+
+        mail_raw = data.pop("mail", None) or {}
+        captcha_raw = data.pop("captcha", None) or {}
+        browser_raw = data.pop("browser", None) or {}
+        base = cls()
+        cfg = cls(
+            base_url=str(data.get("base_url") or os.environ.get("ALLMODELS_BASE_URL") or base.base_url),
+            engine=str(data.get("engine") or os.environ.get("ALLMODELS_ENGINE") or base.engine),
+            count=int(data.get("count", base.count)),
+            concurrency=int(data.get("concurrency", base.concurrency)),
+            attempts=int(data.get("attempts", base.attempts)),
+            retry_rounds=int(data.get("retry_rounds", base.retry_rounds)),
+            timeout=float(data.get("timeout", base.timeout)),
+            language=str(data.get("language", base.language)),
+            user_agent=str(data.get("user_agent", "") or ""),
+            proxy_rotate=bool(data.get("proxy_rotate", base.proxy_rotate)),
+            verify_email=bool(data.get("verify_email", base.verify_email)),
+            keys_per_account=max(1, int(data.get("keys_per_account", base.keys_per_account))),
+            key_name_template=str(data.get("key_name_template", base.key_name_template)),
+            output_dir=Path(str(data.get("output_dir", "out"))),
+            push_url=str(data.get("push_url") or os.environ.get("ALLMODELS_GATEWAY_URL") or ""),
+            push_token=str(data.get("push_token") or os.environ.get("ALLMODELS_GATEWAY_TOKEN") or ""),
+            gateway_pool_file=str(data.get("gateway_pool_file") or ""),
+        )
+        delay = data.get("delay") or list(base.delay)
+        if isinstance(delay, (int, float)):
+            cfg.delay = (float(delay), float(delay))
+        elif isinstance(delay, (list, tuple)) and len(delay) == 2:
+            cfg.delay = (float(delay[0]), float(delay[1]))
+
+        proxies = data.get("proxies") or []
+        if isinstance(proxies, str):
+            proxies = [proxies]
+        cfg.proxies = [p for p in (normalize_proxy(str(x)) for x in proxies) if p]
+
+        cfg.mail = MailConfig(
+            provider=str(mail_raw.get("provider", cfg.mail.provider)),
+            domain=str(mail_raw.get("domain", "") or ""),
+            domains=[str(d).strip().lower() for d in (mail_raw.get("domains") or []) if str(d).strip()],
+            address=str(mail_raw.get("address", "") or ""),
+            prefix=str(mail_raw.get("prefix", "") or ""),
+            imap_host=str(mail_raw.get("imap_host", "") or ""),
+            imap_port=int(mail_raw.get("imap_port", 993) or 993),
+            imap_user=str(mail_raw.get("imap_user", "") or ""),
+            imap_password=str(mail_raw.get("imap_password", "") or ""),
+            verify_timeout=float(mail_raw.get("verify_timeout", 180.0) or 180.0),
+            verify_pattern=str(mail_raw.get("verify_pattern", MailConfig.verify_pattern)),
+        )
+        cfg.mail.imap_host = cfg.mail.imap_host or os.environ.get("ALLMODELS_IMAP_HOST", "")
+        cfg.mail.imap_user = cfg.mail.imap_user or os.environ.get("ALLMODELS_IMAP_USER", "")
+        cfg.mail.imap_password = cfg.mail.imap_password or os.environ.get("ALLMODELS_IMAP_PASSWORD", "")
+
+        cfg.captcha = CaptchaConfig(
+            provider=str(
+                captcha_raw.get("provider")
+                or os.environ.get("ALLMODELS_CAPTCHA_PROVIDER")
+                or cfg.captcha.provider
+            ),
+            api_key=str(captcha_raw.get("api_key") or os.environ.get("ALLMODELS_CAPTCHA_KEY") or ""),
+            action=str(captcha_raw.get("action") or "signup"),
+            timeout=float(captcha_raw.get("timeout", 150.0) or 150.0),
+            poll=float(captcha_raw.get("poll", 3.0) or 3.0),
+        )
+
+        cfg.browser = BrowserConfig(
+            stack=str(browser_raw.get("stack") or os.environ.get("ALLMODELS_BROWSER_STACK") or "auto"),
+            headless=bool(browser_raw.get("headless", True)),
+            cdp=str(browser_raw.get("cdp") or os.environ.get("ALLMODELS_CDP") or ""),
+            humanize=float(browser_raw.get("humanize", 1.0) or 1.0),
+            geoip=bool(browser_raw.get("geoip", True)),
+            turnstile_timeout=float(browser_raw.get("turnstile_timeout", 50.0) or 50.0),
+            screenshots=bool(browser_raw.get("screenshots", True)),
+            profile_dir=str(browser_raw.get("profile_dir") or ""),
+        )
+
+        for key, value in (overrides or {}).items():
+            if value is None:
+                continue
+            if key == "mail_provider":
+                cfg.mail.provider = str(value)
+            elif key == "mail_domain":
+                cfg.mail.domain = str(value)
+            elif key == "mail_domains":
+                rows = [str(x).strip().lower() for x in (value or [])]
+                cfg.mail.domains = [x for x in rows if x]
+            elif key == "mail_address":
+                cfg.mail.address = str(value)
+            elif key == "captcha_provider":
+                cfg.captcha.provider = str(value)
+            elif key == "captcha_key":
+                cfg.captcha.api_key = str(value)
+            elif key == "browser_stack":
+                cfg.browser.stack = str(value)
+            elif key == "headless":
+                cfg.browser.headless = bool(value)
+            elif key == "cdp":
+                cfg.browser.cdp = str(value)
+            elif key == "humanize":
+                cfg.browser.humanize = float(value)
+            elif hasattr(cfg, key):
+                setattr(cfg, key, value)
+
+        if not cfg.proxies:
+            fallback = env_proxy()
+            if fallback:
+                cfg.proxies = [fallback]
+        cfg.output_dir = Path(cfg.output_dir)
+        cfg.db_path = Path(cfg.db_path) if cfg.db_path else cfg.output_dir / "accounts.sqlite3"
+        return cfg
+
+    @staticmethod
+    def _discover() -> Path | None:
+        for name in DEFAULT_CONFIG_FILES:
+            candidate = Path(name)
+            if candidate.exists():
+                return candidate
+        here = Path(__file__).resolve().parent.parent
+        for name in DEFAULT_CONFIG_FILES:
+            candidate = here / name
+            if candidate.exists():
+                return candidate
+        return None
+
+    # -------------------------------------------------------------- accessors
+    def proxy_for(self, index: int) -> str:
+        if not self.proxies:
+            return ""
+        return self.proxies[index % len(self.proxies)]
+
+    def key_name(self, email: str) -> str:
+        local = email.split("@")[0]
+        try:
+            return self.key_name_template.format(local=local, date=__import__("time").strftime("%Y-%m-%d"))
+        except (KeyError, IndexError):
+            return local
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "base_url": self.base_url,
+            "engine": self.engine,
+            "count": self.count,
+            "concurrency": self.concurrency,
+            "attempts": self.attempts,
+            "retry_rounds": self.retry_rounds,
+            "delay": self.delay,
+            "verify_email": self.verify_email,
+            "keys_per_account": self.keys_per_account,
+            "proxies": len(self.proxies),
+            "mail_provider": self.mail.provider,
+            "mail_domains": self.mail.domains,
+            "captcha": self.captcha.provider,
+            "browser": {"stack": self.browser.stack, "headless": self.browser.headless, "cdp": bool(self.browser.cdp)},
+            "output_dir": str(self.output_dir),
+            "db": str(self.db_path),
+            "push": bool(self.push_url and self.push_token),
+        }

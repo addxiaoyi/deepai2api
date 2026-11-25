@@ -6,11 +6,13 @@
 //   sessions{}  — admin WebUI sessions
 //
 // Written with atomic replace so a crash never leaves a half-written file.
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-const EMPTY = { version: 2, accounts: [], keys: [], sessions: {} };
+import { withFileLock } from "./lock.mjs";
+
+const EMPTY = { version: 2, accounts: [], keys: [], sessions: {}, tombstones: { accounts: [], keys: [] } };
 
 export class Store {
   constructor(path, { writeDelayMs = 750 } = {}) {
@@ -20,6 +22,20 @@ export class Store {
     this.dirty = false;
     this.timer = null;
     this.flushing = false;
+    // Cross-process safety: the gateway, the MCP server and the CLI may all hold
+    // a Store for the same file. Remember when we last wrote it, and merge the
+    // on-disk copy in whenever another process wrote in between.
+    this.writtenAt = mtimeOf(path);
+    // Content fingerprint of the last bytes we wrote: exact detection of
+    // "somebody else wrote since", independent of filesystem mtime granularity.
+    this.writtenHash = hashFile(path);
+    this.deletedAccounts = new Set();
+    this.deletedKeys = new Set();
+    // What *this* process created/changed since the last flush. Entries that only
+    // exist locally and are not in here were deleted by the other process.
+    this.ownedAccounts = new Set();
+    this.ownedKeys = new Set();
+    this.onLockBusy = null;
   }
 
   static at(dataDir, options) {
@@ -60,6 +76,7 @@ export class Store {
     };
     if (existing) {
       Object.assign(existing, patch);
+      this.ownedAccounts.add(existing.id);
       this.save();
       return existing;
     }
@@ -73,6 +90,7 @@ export class Store {
       ...patch,
     };
     this.state.accounts.push(created);
+    this.ownedAccounts.add(created.id);
     this.saveNow();
     return created;
   }
@@ -92,13 +110,27 @@ export class Store {
     const before = this.state.accounts.length;
     this.state.accounts = this.state.accounts.filter((a) => a.id !== id);
     if (this.state.accounts.length === before) return false;
+    this.deletedAccounts.add(id);
+    this.addTombstone("accounts", id);
     this.saveNow();
     return true;
   }
 
   clearAccount() {
+    for (const account of this.state.accounts) {
+      this.deletedAccounts.add(account.id);
+      this.addTombstone("accounts", account.id);
+    }
     this.state.accounts = [];
     this.saveNow();
+  }
+
+  addTombstone(kind, id) {
+    this.state.tombstones ??= { accounts: [], keys: [] };
+    this.state.tombstones[kind] ??= [];
+    const list = this.state.tombstones[kind];
+    if (!list.some((row) => row.id === id)) list.push({ id, at: Date.now() });
+    if (list.length > 500) list.splice(0, list.length - 500);
   }
 
   /** Record the outcome of a turn against an account. */
@@ -149,6 +181,7 @@ export class Store {
       limits: normalizeLimits(limits),
     };
     this.state.keys.push(key);
+    this.ownedKeys.add(key.id);
     this.saveNow();
     return publicKey(key);
   }
@@ -165,6 +198,8 @@ export class Store {
     const before = this.state.keys.length;
     this.state.keys = this.state.keys.filter((k) => k.id !== id);
     if (this.state.keys.length === before) return false;
+    this.deletedKeys.add(id);
+    this.addTombstone("keys", id);
     this.saveNow();
     return true;
   }
@@ -241,6 +276,19 @@ export class Store {
     this.timer.unref?.();
   }
 
+  /** Read the file again and fold in what other processes wrote (no write). */
+  reloadFromDisk() {
+    if (!existsSync(this.path)) return false;
+    const disk = load(this.path);
+    this.state = mergeStoreState(this.state, disk, {
+      deletedAccounts: this.deletedAccounts,
+      deletedKeys: this.deletedKeys,
+      ownedAccounts: this.ownedAccounts,
+      ownedKeys: this.ownedKeys,
+    });
+    return true;
+  }
+
   /** Write immediately. Used for account/key changes and on shutdown. */
   flush() {
     if (this.timer) {
@@ -251,10 +299,39 @@ export class Store {
     this.flushing = true;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
-      const tmp = `${this.path}.${randomUUID()}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-      renameSync(tmp, this.path);
-      this.dirty = false;
+      const locked = withFileLock(this.path, () => {
+        // Another process (MCP server / CLI) may have written since our last
+        // flush: fold its accounts, keys and sessions in before overwriting.
+        if (hashFile(this.path) !== this.writtenHash) {
+          const disk = load(this.path);
+          this.state = mergeStoreState(this.state, disk, {
+            deletedAccounts: this.deletedAccounts,
+            deletedKeys: this.deletedKeys,
+            ownedAccounts: this.ownedAccounts,
+            ownedKeys: this.ownedKeys,
+          });
+        }
+        this.deletedAccounts.clear();
+        this.deletedKeys.clear();
+        // ownedAccounts/ownedKeys are NOT cleared: a concurrent writer that
+        // started from a stale base can drop our entries, and the next merge
+        // must recognise them as ours instead of treating them as deletions.
+        const tmp = `${this.path}.${randomUUID()}.tmp`;
+        const bytes = JSON.stringify(this.state, null, 2);
+        writeFileSync(tmp, bytes, { mode: 0o600 });
+        renameSync(tmp, this.path);
+        this.writtenAt = Date.now();
+        this.writtenHash = createHash("sha1").update(bytes).digest("hex");
+      });
+      if (locked.ok) {
+        this.dirty = false;
+      } else if (locked.reason === "busy") {
+        // Keep dirty and let the next save() retry; never drop a structural change.
+        this.dirty = true;
+        this.onLockBusy?.();
+      } else if (locked.error) {
+        throw locked.error;
+      }
     } finally {
       this.flushing = false;
     }
@@ -311,8 +388,7 @@ export function publicAccount(account) {
   };
 }
 
-function load(path) {
-  if (!existsSync(path)) return structuredClone(EMPTY);
+function load(path) {  if (!existsSync(path)) return structuredClone(EMPTY);
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
     const accounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
@@ -352,8 +428,121 @@ function load(path) {
       accounts,
       keys,
       sessions: parsed.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {},
+      tombstones: {
+        accounts: Array.isArray(parsed.tombstones?.accounts) ? parsed.tombstones.accounts : [],
+        keys: Array.isArray(parsed.tombstones?.keys) ? parsed.tombstones.keys : [],
+      },
     };
   } catch {
     return structuredClone(EMPTY);
   }
+}
+
+function mtimeOf(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** Stable fingerprint of a file's bytes; "" when it does not exist yet. */
+function hashFile(path) {
+  try {
+    return createHash("sha1").update(readFileSync(path)).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Union two copies of the gateway state.
+ *
+ * Structure (which accounts / keys exist) is decided by both sides — a key minted
+ * by the MCP server must survive the gateway's next flush, and an account linked
+ * in the browser must survive the CLI's. Usage counters take the max, deletes are
+ * explicit (an id in `deleted*` never comes back), and a revoked key stays revoked.
+ */
+export function mergeStoreState(
+  local,
+  disk,
+  { deletedAccounts = new Set(), deletedKeys = new Set(), ownedAccounts = null, ownedKeys = null } = {},
+) {
+  const accounts = new Map();
+  for (const account of disk.accounts ?? []) accounts.set(account.id, account);
+  for (const account of local.accounts ?? []) {
+    const other = accounts.get(account.id);
+    if (!other) {
+      // Only keep a local-only account when this process is the one that created
+      // it; otherwise the other process deleted it.
+      if (!ownedAccounts || ownedAccounts.has(account.id)) accounts.set(account.id, account);
+      continue;
+    }
+    const newer = (account.lastUsedAt ?? "") >= (other.lastUsedAt ?? "") ? account : other;
+    accounts.set(account.id, {
+      ...other,
+      ...newer,
+      id: account.id,
+      requests: Math.max(account.requests ?? 0, other.requests ?? 0),
+      promptTokens: Math.max(account.promptTokens ?? 0, other.promptTokens ?? 0),
+      completionTokens: Math.max(account.completionTokens ?? 0, other.completionTokens ?? 0),
+      cooldownUntil: Math.max(account.cooldownUntil ?? 0, other.cooldownUntil ?? 0),
+      healthy: newer.healthy !== false,
+      linkedAt: other.linkedAt ?? account.linkedAt,
+    });
+  }
+  for (const id of deletedAccounts) accounts.delete(id);
+
+  const keys = new Map();
+  for (const key of disk.keys ?? []) keys.set(key.id, key);
+  for (const key of local.keys ?? []) {
+    const other = keys.get(key.id);
+    if (!other) {
+      if (!ownedKeys || ownedKeys.has(key.id)) keys.set(key.id, key);
+      continue;
+    }
+    keys.set(key.id, {
+      ...other,
+      ...key,
+      id: key.id,
+      revoked: key.revoked === true || other.revoked === true,
+      requests: Math.max(key.requests ?? 0, other.requests ?? 0),
+      promptTokens: Math.max(key.promptTokens ?? 0, other.promptTokens ?? 0),
+      completionTokens: Math.max(key.completionTokens ?? 0, other.completionTokens ?? 0),
+      lastUsedAt: [key.lastUsedAt, other.lastUsedAt].filter(Boolean).sort().pop() ?? null,
+    });
+  }
+  for (const id of deletedKeys) keys.delete(id);
+
+  const sessions = { ...(disk.sessions ?? {}), ...(local.sessions ?? {}) };
+  const entries = Object.entries(sessions);
+  let kept = sessions;
+  if (entries.length > 32) {
+    entries.sort((a, b) => String(a[1]?.createdAt).localeCompare(String(b[1]?.createdAt)));
+    kept = Object.fromEntries(entries.slice(entries.length - 32));
+  }
+
+  // Tombstones are the durable form of a delete: they travel with the file, so a
+  // process that still has the entry in memory cannot bring it back.
+  const tombstones = mergeTombstones(local, disk);
+  for (const row of tombstones.accounts) accounts.delete(row.id);
+  for (const row of tombstones.keys) keys.delete(row.id);
+
+  return { version: 2, accounts: [...accounts.values()], keys: [...keys.values()], sessions: kept, tombstones };
+}
+
+function mergeTombstones(local, disk) {
+  const out = { accounts: [], keys: [] };
+  for (const kind of ["accounts", "keys"]) {
+    const seen = new Map();
+    for (const row of [...(disk.tombstones?.[kind] ?? []), ...(local.tombstones?.[kind] ?? [])]) {
+      if (!row?.id) continue;
+      const at = Number(row.at ?? 0);
+      const previous = seen.get(row.id);
+      seen.set(row.id, { id: row.id, at: previous ? Math.max(previous, at) : at });
+    }
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+    out[kind] = [...seen.values()].filter((row) => row.at >= cutoff).slice(-500);
+  }
+  return out;
 }

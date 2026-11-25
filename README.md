@@ -155,9 +155,167 @@ WebUI 侧新增三个管理接口（`deepai.py` 透传到网关）：
 | `browser`（Camoufox，无头） | 1/1 成功，43.9 s；UA `Firefox/158.0`、`webdriver=false`、时区随代理 IP |
 | 网关拉起 worker（2 并发，2 key 入池） | 2/2 成功，33.5 s，`/health` 账号数 0 → 3 |
 | 一次性域名（`mail.tm` 的 `euploading.com`） | `400 {"email": ["Please use your own email address."]}` → 自动换域 |
-| 离线用例 | `python -m unittest discover -s tests`，24/24 |
+| 离线用例 | `python -m unittest discover -s tests`，26/26 |
 
-细节、配置项、排错见 [`tools/deepai-reg/README.md`](tools/deepai-reg/README.md)。
+面板能做的不只是「点一下」：进度条 + 预计剩余（按吞吐算 ETA）、失败单元换
+persona/域名/代理**自动重跑一轮**并把原因分类留档（`email_rejected` / `blocked` /
+`rate_limited` / `no_api_key` / `transport`）、日志按级别筛选并一键导出 `.log`、
+域名战绩画成绿/红双色条。细节见
+[`tools/deepai-reg/README.md`](tools/deepai-reg/README.md)。
+
+---
+
+## 3.55 Allmodels 号池（新注册机 + 号池协议）
+
+除了 DeepAI 这条线，仓库里现在还有一套**独立的 Allmodels 号池**：`dash.allmodels.io`
+面板批量注册 → 自动领面板 Key → 自动发网关 `sk-dcg-` Key → 全部写进一份号池配置文件，
+支持并发注册后统一导出。
+
+### 双引擎：协议 + 指纹浏览器
+
+两条腿跑同一套流程，产出记录同形，`engine` 字段标明来源：
+
+| `--engine` | 行为 |
+| --- | --- |
+| `protocol` | httpx 走完四步，最快；Turnstile 用解题器 token |
+| `browser` | 真实浏览器开 `/signup`，人类化填表/点击，Turnstile 自己过；领 key 用页内同源 `fetch` |
+| `auto`（默认） | 先协议，遇 `captcha_required` / `blocked` 当场切浏览器重跑并记 `engine=browser` |
+
+指纹内核自动选（也可 `--browser-stack` 指定），参考的都是开源项目：
+
+- **Camoufox**（Firefox，C++ 层指纹改写，托管挑战通过率最高）<https://github.com/daijro/camoufox>
+- **Patchright**（Playwright 反检测分支，Chromium 指纹 + 真实 TLS）<https://github.com/Kaliiiiiiiiii-Vinyzu/patchright>
+- **Playwright Chromium** 兜底，指纹生成思路见 **browserforge** <https://github.com/daijro/browserforge>；
+  同类可替代：**nodriver**（CDP）<https://github.com/ultrafunkamsterdam/nodriver>、SeleniumBase UC 模式
+- 已有商业指纹浏览器？`--cdp http://127.0.0.1:50325` 直接接管 AdsPower / BitBrowser / Morelogin 的 profile
+
+### 在编程工具里调用（MCP / HTTP）
+
+工具层一份 schema 三个入口（[`src/allmodels-tools.mjs`](src/allmodels-tools.mjs)）：
+
+| 入口 | 适合 |
+| --- | --- |
+| `node src/allmodels-mcp.mjs` | Claude Code / Cursor / Codex CLI / VS Code Copilot（MCP over stdio） |
+| `POST /api/admin/allmodels/tools/:name` | Open WebUI 工具插件、n8n、Dify、自定义工作流（HTTP） |
+| `node src/allmodels-cli.mjs` | 人、shell、CI |
+
+工具：`allmodels_status`、`allmodels_register`、`allmodels_pool`、`allmodels_export`、
+`allmodels_import`、`allmodels_keys`、`allmodels_mark_health`、`allmodels_remove`、`allmodels_probe`。
+项目已带 [`.mcp.json`](.mcp.json)，在该目录打开 Claude Code 即自动发现；Cursor / Codex / VS Code
+的配置片段见 [`docs/ALLMODELS-MCP.md`](docs/ALLMODELS-MCP.md)。
+
+```bash
+node src/allmodels-mcp.mjs --print-tools    # 看 tools/list + OpenAI function schema
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/admin/allmodels/tools
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"arguments":{"count":3,"engine":"auto","captcha":"capsolver","captchaKey":"KEY"}}' \
+  http://127.0.0.1:8787/api/admin/allmodels/tools/allmodels_register
+```
+
+### 与既有模块的隔离（互不冲突）
+
+- **命名空间**：文件 `allmodels-pool.json` / `allmodels-register-job.json` / `allmodels-register.lock`、
+  路由 `/api/admin/allmodels/*`、环境变量 `ALLMODELS_*`、MCP 工具 `allmodels_*`、python 产物
+  `tools/allmodels-reg/out/`（已 gitignore）—— 与 DeepAI 的 state、路由、变量零重叠。
+- **对既有代码只做增量**：`/v1/*`、OAuth、DeepAI 账号池、Open WebUI 补丁均未改写；
+  `Store` 只多了一层跨进程合并（见下）。
+- **一轮一个任务**：`data/allmodels-register.lock`（pid + 6h 回收）保证网关 / MCP / CLI
+  不会同时拉起两个 worker，第二个直接 `409`。
+- **写不丢更新**：两个 state 文件都是「`O_EXCL` 锁 + 内容 SHA-1 比对 + 合并」——计数取 max、
+  `revoked` 不回退、已发的 `gatewayKey` 不被覆盖、被删条目不被旧内存复活。
+  细节见 [`docs/ALLMODELS-POOL.md`](docs/ALLMODELS-POOL.md) 第 7 节。
+
+### 协议（从面板 SPA 还原，线上校验过）
+
+| 步骤 | 请求 | 说明 |
+| --- | --- | --- |
+| 1 | `POST /api/auth/sign-up/email` + 头 `x-turnstile-token` | Better Auth；无 token 直接 `403 {"code":"captcha_failed"}` |
+| 2 | `GET /api/auth/verify-email?token=…` | 邮件里的链接，302 进 SPA |
+| 3 | `GET /api/me/overview` | 组织 / 项目 / guardrail（异步 provision） |
+| 4 | `GET /api/me/signup-key` → `{"key":"sk_live_…"}` | 注册时自动下发的 Key |
+| + | `POST /api/keys` `{displayName,projectId,guardrailId,environment}` | 需要多把 Key 时补建 |
+
+Turnstile 站点 key `0x4AAAAAAFoFe99_cOH0RnFT`（action `signup`）；`gmail.com` /
+`googlemail.com` 被拒；人机校验可选 capsolver / 2captcha / Playwright 真机渲染 / 手工 token。
+
+### 用法
+
+```powershell
+# 网关侧一条命令：并发注册 + 自动建 key + 写号池 + 导出
+node src/allmodels-cli.mjs register -n 20 -c 4 `
+  --mail-provider mailtm --captcha capsolver --captcha-key $env:CAPSOLVER_KEY `
+  --export jsonl
+
+node src/allmodels-cli.mjs pool                     # 号池当前状态（脱敏）
+node src/allmodels-cli.mjs export --format csv      # 账号 + key 一次性导出
+node src/allmodels-cli.mjs import accounts.jsonl    # 外部账号导入并补发 key
+```
+
+```powershell
+# 等价的手工 worker（网关没起也能跑，事后 push 进池）
+cd tools\allmodels-reg
+python -m pip install -r requirements.txt
+python -m allmodels_reg doctor --captcha capsolver --captcha-key $env:CAPSOLVER_KEY
+python -m allmodels_reg run -n 20 -c 4 --mail-provider imap --mail-domain example.com
+python -m allmodels_reg push --push-url http://127.0.0.1:8787 --push-token <网关口令>
+```
+
+### 号池文件
+
+`data/allmodels-pool.json`（`0600`、原子替换、`data/` 已 gitignore），schema
+`dcg.pool/allmodels@1`：每个账号带面板密码、面板 Key、项目/guardrail id、健康计数、
+会话 cookie，以及 `gatewayKey.plaintext`（唯一保存明文的地方）。
+完整字段与写入口径见 [`docs/ALLMODELS-POOL.md`](docs/ALLMODELS-POOL.md)。
+
+### 管理接口
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/admin/allmodels/status` | 当前/最近一轮 job + 号池统计 |
+| `POST /api/admin/allmodels/register` | 起批量注册（`count`、`concurrency`、`engine`、`browserStack`、`cdp`、`headful`、`mailProvider`、`email`、`captcha`、`captchaKey`、`baseUrl`、`proxies[]`、`keysPerAccount`、`verifyEmail`、`export`）；`export` 让任务结束后自动统一导出 |
+| `POST /api/admin/allmodels/register/stop` | 停任务（Windows 整棵进程树） |
+| `GET /api/admin/allmodels/pool` | 号池脱敏视图 |
+| `POST /api/admin/allmodels/pool/import` | worker 回推 / 手工入池（按 `apiKey` 幂等，key 只发一次） |
+| `POST /api/admin/allmodels/pool/:id/health` | 回报调用结果（计数 + 冷却） |
+| `DELETE /api/admin/allmodels/pool/:id` | 移除账号 |
+| `POST /api/admin/allmodels/pool/export?format=jsonl\|csv\|pool[&download=1]` | 统一导出账号 + Key |
+| `GET /api/admin/allmodels/keys` | 每个账号的面板 Key 元信息 + 网关 Key 前缀 |
+
+### 测试
+
+| 用例 | 结果 |
+| --- | --- |
+| `python -m pytest tools/allmodels-reg/tests -q`（离线协议 + 引擎回落） | 13/13 |
+| `node --test tests/allmodels-pool.test.mjs`（号池：去重 / 轮询 / 冷却 / 导出 / 重载） | 7/7 |
+| `node --test tests/allmodels-concurrency.test.mjs`（多进程：合并 / 删除 / 撤销 / 锁 / 真双进程并发） | 14/14 |
+| `node --test tests/allmodels-mcp.test.mjs`（MCP 握手 + 9 个工具调用） | 1/1 |
+| `node tests/allmodels-e2e.mjs`（mock 面板 → worker → 网关入池 → 导出，含指纹浏览器与工具桥） | 11/11 |
+
+细节见 [`tools/allmodels-reg/README.md`](tools/allmodels-reg/README.md)。
+
+---
+
+## 3.6 Linux 一键部署
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/addxiaoyi/deepai2api/main/deploy/install.sh | sudo bash
+# 或者带上 WebUI（会装 docker 并构建 fork）
+curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
+```
+
+装完的样子：
+
+| 项 | 位置 |
+| --- | --- |
+| 网关 | `/opt/deepai2api`，`systemctl status deepai-gateway`（默认 0.0.0.0:8787） |
+| WebUI | `docker compose up` 的 fork，`systemctl status deepai-webui`（:3000） |
+| 口令/环境 | `/etc/deepai2api/env`（0600，首次安装自动生成管理口令） |
+| 数据 | `/var/lib/deepai2api/data`（`gateway-state.json`、`register-job.json`） |
+| 注册 worker | `/opt/deepai2api/.venv/bin/python` + `tools/deepai-reg` |
+
+脚本是幂等的：`--source .` 从当前目录装、`--dir/--port/--user` 可改、
+`--rotate-token` 换口令、`--with-camoufox` 顺带拉 1.3 GB 的浏览器内核；
+没有 systemd 或非 root 会直接报错退出。文件在 [`deploy/`](deploy/install.sh)。
 
 ---
 
@@ -224,6 +382,11 @@ src/
   keys.mjs        sk-dcg-… 铸造与哈希
 
   config/credentials/machine/dispatcher/semaphore
+  allmodels-pool.mjs    Allmodels 号池：落盘格式、去重、健康计数、导出、网关 Key 绑定
+  allmodels-register.mjs 批量注册控制器（起 python worker、流式事件、入池）
+  allmodels-cli.mjs    register / pool / export / import / keys
+  allmodels-tools.mjs  工具层：9 个工具的 schema + handler（MCP / HTTP 共用）
+  allmodels-mcp.mjs    MCP server（stdio，Claude Code / Cursor / Codex / VS Code）
 patches/
   0001-register-deepai-provider.patch   对上游的 14 行改动
   files/                                新增的 4 个文件 + overlay Dockerfile
@@ -232,10 +395,18 @@ tests/
   e2e.mjs         27 项，打 mock 上游，不碰真实账号
   smoke.mjs       真实上游冒烟
   mock-upstream.mjs
+  allmodels-pool.test.mjs  号池协议单测
+  allmodels-e2e.mjs        mock 面板 → worker → 入池 → 导出
+  mock-allmodels.mjs       面板 mock（也可单独跑起来手测）
 scripts/
   openwebui.ps1   构建/启动 fork
   screenshot.mjs  headless Chrome 截图 + 渲染后 DOM 快照
 tools/deepai-reg/ 批量注册机（协议引擎 + Camoufox，产物灌进 accounts[]）
+tools/allmodels-reg/ Allmodels 注册机（Better Auth + Turnstile，产物灌进号池文件）
+deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
+docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
+docs/ALLMODELS-MCP.md  编程工具接入（MCP / HTTP 工具桥 / 各家配置片段）
+.mcp.json              项目级 MCP 配置（Claude Code 直接发现）
 docker-compose.yml  overlay 镜像（官方 v0.13.4 + 我们的后端/前端文件）
 scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 ```
@@ -246,9 +417,14 @@ scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 
 ```
 node tests\e2e.mjs     27/27   管理台登录、伪造 state 拒绝、OAuth 交换、铸 Key、
-                               转发、Anthropic（JSON+SSE）、billing、限额、
-                               粘性会话、故障切换、全灭 503、撤销、解绑
+                              转发、Anthropic（JSON+SSE）、billing、限额、
+                              粘性会话、故障切换、全灭 503、撤销、解绑
 node tests\smoke.mjs   6/6     真实上游：目录 / 非流式 / 流式 / 配额
+node --test tests\allmodels-pool.test.mjs   7/7   号池协议 + 重载保留 id
+node --test tests\allmodels-concurrency.test.mjs  14/14  多进程合并 / 删除 / 锁
+node --test tests\allmodels-mcp.test.mjs    1/1   MCP 握手 + 工具调用
+node tests\allmodels-e2e.mjs                11/11  批量注册 → 入池 → 导出（含指纹浏览器、工具桥）
+python -m pytest tools\allmodels-reg\tests -q  13/13 面板注册协议 + 引擎回落
 ```
 
 真实上游已验证：`/v1/chat/completions`（流式+非流式）、`/v1/messages`（返回标准
