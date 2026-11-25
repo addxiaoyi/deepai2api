@@ -1,0 +1,37 @@
+# Poe 注册机 — 配置示例（复制成 config.yaml 生效）
+engine: auto              # protocol | browser | auto
+count: 1
+concurrency: 1            # Poe 风控强，建议 1
+attempts: 2               # 单号内重试
+retry_rounds: 1           # 第一轮失败的账号再跑一轮（换代理/域名）
+delay: [25, 55]           # 账号之间随机停顿（秒）
+account_cooldown: 120     # 同一代理两次注册之间的冷却（秒）
+timeout: 60
+headless: true
+language: en-US
+geoip: true               # 指纹时区/语言跟代理出口 IP 对齐
+device_os: ["windows"]
+
+# 代理池：一号一出口，被判定自动化就 bench 15 分钟
+proxies:
+  - http://127.0.0.1:10808
+
+output_dir: out
+
+mail:
+  provider: tempmail_lol  # 复用 tools/deepai-reg 的邮箱层
+  domains: []             # 指定域名池；留空由 provider 自己分配
+  # provider: imap        # 自有 catch-all 最稳
+  # domain: yourdomain.com
+  # imap_host: imap.yourdomain.com
+  # imap_user: poe@yourdomain.com
+  # imap_password: ...
+
+sms:
+  provider: off           # off | manual | sms_activate | smspool
+  api_key: ""             # 也可用 POE_SMS_API_KEY
+  service: poe
+  country: "0"
+  country_code: "+1"
+  max_price: 0.5
+  wait_seconds: 180

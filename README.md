@@ -295,7 +295,42 @@ python -m allmodels_reg push --push-url http://127.0.0.1:8787 --push-token <网�
 
 ---
 
-## 3.6 Linux 一键部署
+## 3.56 Poe 注册机（`tools/poe-reg`）
+
+给 `poe.com` 造号：**页内 GraphQL 协议引擎** + **Camoufox 表单引擎**，产物进
+**独立号池**（`data/poe-pool.json` / `out/poe-pool.sqlite3`），与 DeepAI 的 `accounts[]`
+并行且互不影响 —— Poe 的凭据是 `p-b` cookie，不是 api key。
+
+```powershell
+cd tools\poe-reg
+python -m poe_reg doctor
+python -m poe_reg run -n 1 --engine protocol --mail-provider tempmail_lol
+python -m poe_reg pool --export out/poe.jsonl
+```
+
+协议（实测抓的）：
+
+```
+GET  https://poe.com/login            → cf_clearance / p-b
+POST /api/gql_POST  …sendVerificationCodeMutation_Mutation   {emailAddress, phoneNumber:null, recaptchaToken}
+POST /api/gql_POST  …signupWithVerificationCodeMutation_Mutation {verificationCode, emailAddress, phoneNumber:null, subscriptions:[]}
+```
+
+**必须说清的现实**：邮箱段全自动（含一次性域名，验证码秒到），但 Poe 之后要手机号，
+且 `signupWithVerificationCode` 会返回 `recently_verified_phone_number_not_found` ——
+没有短信供应商时账号停在 `email_verified` / `phone_required`，cookie 与 formkey 已入库，
+后续用 `sms.provider = manual | sms_activate | smspool` 补完即可变 `active`。
+
+防封策略针对 Poe 的评分维度（IP/设备声誉）：一号一出口、同代理 120 s 冷却、
+`automated_request_detected` 直接 bench 该代理 15 分钟、CF 没过 bench 10 分钟、
+每次新指纹不复用 profile、账号间 25–55 s 抖动、`p-b` 入库不在异地重登。
+
+WebUI 同一页下面新增「Poe 号池（独立）」卡片：注册（数量/引擎/邮箱/短信）、
+进度条 + ETA、日志与导出、号池表格（状态可手动改 `active` / 删除）。
+
+---
+
+## 3.57 Linux 一键部署
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/addxiaoyi/deepai2api/main/deploy/install.sh | sudo bash
@@ -316,6 +351,55 @@ curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
 脚本是幂等的：`--source .` 从当前目录装、`--dir/--port/--user` 可改、
 `--rotate-token` 换口令、`--with-camoufox` 顺带拉 1.3 GB 的浏览器内核；
 没有 systemd 或非 root 会直接报错退出。文件在 [`deploy/`](deploy/install.sh)。
+
+---
+
+## 3.58 三个号池的共存约定
+
+仓库里现在同时有 DeepAI、Allmodels、Poe 三套"注册 + 号池"，它们**只共享代码，不共享状态**：
+
+| 边界 | DeepAI 池 | Allmodels 池 | Poe 池 |
+| --- | --- | --- | --- |
+| 池文件 | `data/gateway-state.json` | `data/allmodels-pool.json` | `data/poe-pool.json` |
+| 凭据形态 | `api_key` | dashboard key + 网关 key | `p-b` cookie |
+| 管理路由 | `/api/admin/*` | `/api/admin/allmodels/*` | `/api/poe/*` |
+| worker | `tools/deepai-reg`（`python -m deepai_reg`） | `tools/allmodels-reg` | `tools/poe-reg`（`python -m poe_reg`） |
+| 环境变量 | `DEEPAI_*` | `ALLMODELS_*` | `POE_*` |
+| 消费方 | `scheduler.mjs` → `/v1` | `provider-relay.mjs` | 外部（cookie 直接给客户端） |
+
+保证不打架的几处实现细节：
+
+* **写入口独立**：网关每个池一个 writer 类（`Store` / `AllmodelsPool` / `PoePool`），
+  push 端点也各自独立（`/api/admin/accounts` vs `/api/allmodels/...` vs `/api/poe/accounts`），
+  一个池的 upsert 不会碰另一个池的文件；`data/` 下三个 JSON 可以同时存在。
+* **路由不重叠**：全部是 exact-match 或带前缀的正则，`/api/poe/*` 与
+  `/api/admin/allmodels/*` 没有共同前缀；三者都走同一套 admin 鉴权（会话或 Bearer token）。
+* **环境变量不串**：`Registrations` 按工具取自己的覆盖变量 ——
+  设了 `DEEPAI_REGISTER_DIR` 不会把 Poe worker 指到 DeepAI 的目录，反之亦然
+  （`POE_REGISTER_DIR` / `POE_PYTHON` 只作用于 Poe）。
+* **任务状态分文件**：`data/register-job.json`、`data/allmodels-*.json`、
+  `data/poe-register-job.json`，重启后各自恢复，互不覆盖。
+* **WebUI 一页三卡**：DeepAI 池 / 批量注册（DeepAI） / Poe 号池，各自独立轮询与按钮，
+  取消或报错只影响自己那块。
+* **Python 包不互相 import 状态**：`poe_reg` 只在两处复用 `deepai_reg` 的**纯函数层**
+  （邮箱 provider、persona），不读写对方的 SQLite。
+
+实测（合并后的工作树，同一进程）：
+
+```
+GET  /health                    200  含 accounts / allmodels / poe 三段
+GET  /api/admin/state           200  allmodels 池状态在内，poe 不在内
+GET  /api/admin/allmodels/status 200
+GET  /api/admin/providers       200
+GET  /api/poe/health            200  {"total":0,...}
+GET  /api/admin/register        200  toolDir=tools/deepai-reg
+GET  /api/poe/register          200  toolDir=tools/poe-reg
+POST /api/poe/accounts          → 只写 poe-pool.json
+POST /api/admin/accounts        → 只写 gateway-state.json（poe 计数不变）
+```
+
+回归：`node tests/e2e.mjs` **28/28**、`node --test tests/allmodels-*.test.mjs` **22/22**、
+`python -m unittest`（deepai 26 / poe 8）全绿。
 
 ---
 
@@ -403,6 +487,7 @@ scripts/
   screenshot.mjs  headless Chrome 截图 + 渲染后 DOM 快照
 tools/deepai-reg/ 批量注册机（协议引擎 + Camoufox，产物灌进 accounts[]）
 tools/allmodels-reg/ Allmodels 注册机（Better Auth + Turnstile，产物灌进号池文件）
+tools/poe-reg/     Poe 注册机（页内 GraphQL + Camoufox，独立 cookie 号池）
 deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
 docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
 docs/ALLMODELS-MCP.md  编程工具接入（MCP / HTTP 工具桥 / 各家配置片段）

@@ -36,7 +36,19 @@ CREATE TABLE IF NOT EXISTS attempts (
     error     TEXT,
     at        TEXT
 );
+CREATE TABLE IF NOT EXISTS failures (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    email     TEXT,
+    domain    TEXT,
+    engine    TEXT,
+    proxy     TEXT,
+    kind      TEXT,
+    reason    TEXT,
+    round     INTEGER DEFAULT 0,
+    at        TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_attempts_at ON attempts(at);
+CREATE INDEX IF NOT EXISTS idx_failures_at ON failures(at);
 """
 
 GATEWAY_KEYS = ("apiKey", "username", "isPro", "email", "password", "createdAt")
@@ -91,6 +103,48 @@ class Store:
             (email, engine, proxy, status, error[:800], time.strftime("%Y-%m-%dT%H:%M:%S%z")),
         )
         self.db.commit()
+
+    def record_failure(
+        self,
+        *,
+        email: str,
+        domain: str,
+        engine: str,
+        proxy: str,
+        kind: str,
+        reason: str,
+        round_no: int = 0,
+    ) -> None:
+        self.db.execute(
+            """INSERT INTO failures (email, domain, engine, proxy, kind, reason, round, at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                email,
+                domain,
+                engine,
+                proxy,
+                kind or "error",
+                (reason or "")[:800],
+                round_no,
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            ),
+        )
+        self.db.commit()
+
+    def failure_summary(self, limit: int = 12) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            """SELECT kind, COUNT(*) AS count, MAX(reason) AS example
+               FROM failures GROUP BY kind ORDER BY count DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_failures(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT email, domain, kind, reason, round, at FROM failures ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------- read
     def has_email(self, email: str) -> bool:

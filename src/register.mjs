@@ -41,11 +41,12 @@ export class Registrations {
       ...spec,
     };
     this.statePath = join(dataDir, this.spec.jobFile);
-    this.toolDir =
-      process.env.DEEPAI_REGISTER_DIR ||
-      (this.spec.name === "poe" ? process.env.POE_REGISTER_DIR : "") ||
-      join(repoRoot, "tools", toolName);
-    this.python = process.env.DEEPAI_PYTHON || process.env.POE_PYTHON || (process.platform === "win32" ? "python" : "python3");
+    // Each factory reads its own override first; a DEEPAI_* setting must never
+    // point the Poe worker at the DeepAI tree.
+    const envDir = this.spec.name === "poe" ? process.env.POE_REGISTER_DIR : process.env.DEEPAI_REGISTER_DIR;
+    this.toolDir = envDir || join(repoRoot, "tools", toolName);
+    const envPython = this.spec.name === "poe" ? process.env.POE_PYTHON : process.env.DEEPAI_PYTHON;
+    this.python = envPython || (process.platform === "win32" ? "python" : "python3");
     this.job = null;
     this.child = null;
     this._domainsCache = null;
@@ -130,12 +131,15 @@ export class Registrations {
         this.job.domains = mergeDomain(this.job.domains, event.domain, true);
         this._line("info", `+ ${account.email || account.username} (${event.engine})`);
         try {
-          const mapped = this.spec.mapAccount
-            ? this.spec.mapAccount(account, event)
-            : null;
-          if (mapped) {
-            this.onAccount?.(mapped);
+          if (!this.spec.mapAccount) {
+            // The worker pushes into its own pool over HTTP; count it as landed.
             this.job.pushed = (this.job.pushed ?? 0) + 1;
+          } else {
+            const mapped = this.spec.mapAccount(account, event);
+            if (mapped) {
+              this.onAccount?.(mapped);
+              this.job.pushed = (this.job.pushed ?? 0) + 1;
+            }
           }
         } catch (error) {
           this._line("error", `入池失败 ${account.email}: ${error.message}`);

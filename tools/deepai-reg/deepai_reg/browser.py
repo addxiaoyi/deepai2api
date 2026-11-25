@@ -98,6 +98,57 @@ def _read_error(page: Any) -> str:
         return ""
 
 
+# --------------------------------------------------------------- human input
+#
+# Playwright's click() is a single synthetic event at the element's centre: no
+# path, no hover, no overshoot. Sites that score pointer behaviour (and the
+# Turnstile widget) notice. These helpers move the way a hand does — approach,
+# small corrections, then a settle — and type with per-key latency.
+
+def _human_move_to(page: Any, x: float, y: float, rng: random.Random) -> None:
+    for _ in range(rng.randint(2, 4)):
+        page.mouse.move(
+            x + rng.uniform(-40, 40),
+            y + rng.uniform(-22, 22),
+            steps=rng.randint(2, 5),
+        )
+        page.wait_for_timeout(rng.randint(18, 60))
+    page.mouse.move(x, y, steps=rng.randint(9, 20))
+    page.wait_for_timeout(rng.randint(70, 190))
+
+
+def _human_click(page: Any, locator: Any, rng: random.Random) -> None:
+    box = locator.bounding_box()
+    if not box:
+        locator.click()
+        return
+    x = box["x"] + box["width"] * rng.uniform(0.32, 0.68)
+    y = box["y"] + box["height"] * rng.uniform(0.35, 0.65)
+    _human_move_to(page, x, y, rng)
+    try:
+        locator.click(timeout=15_000, delay=rng.randint(45, 130))
+    except Exception:  # noqa: BLE001 - fall back to a plain click on pointer weirdness
+        locator.click(timeout=15_000)
+
+
+def _human_type(page: Any, text: str, rng: random.Random) -> None:
+    for char in text:
+        page.keyboard.type(char)
+        page.wait_for_timeout(rng.randint(38, 118))
+        if rng.random() < 0.07:
+            page.wait_for_timeout(rng.randint(160, 420))
+
+
+def _warm_up(page: Any, rng: random.Random) -> None:
+    """Scroll a little, drift the pointer, pause — a page that was actually read."""
+    page.mouse.move(rng.randint(120, 900), rng.randint(80, 500), steps=rng.randint(4, 9))
+    page.wait_for_timeout(rng.randint(300, 900))
+    page.mouse.wheel(0, rng.randint(180, 700))
+    page.wait_for_timeout(rng.randint(500, 1300))
+    page.mouse.wheel(0, -rng.randint(80, 320))
+    page.wait_for_timeout(rng.randint(250, 700))
+
+
 def register_with_browser(
     email: str,
     password: str,
@@ -113,6 +164,7 @@ def register_with_browser(
     log: Any = None,
 ) -> dict[str, Any]:
     from camoufox.sync_api import Camoufox  # imported late: optional dependency
+    from camoufox.fingerprints import Screen
 
     rng = rng or random.Random()
     say = log or (lambda *_a, **_k: None)
@@ -123,12 +175,21 @@ def register_with_browser(
 
     launch: dict[str, Any] = {
         "headless": headless,
-        "humanize": True,
+        "humanize": 2.2,
         "os": ["windows"],
         "locale": [locale],
         "geoip": bool(geoip),
         "block_webrtc": True,
         "main_world_eval": True,
+        # A bundled real-device preset (screen/fonts/WebGL/voices as one coherent
+        # set) beats fpgen's synthetic mix for looking like a person's browser.
+        "fingerprint_preset": True,
+        # Headless clamps the claimed screen to the virtual display (1088×612 is a
+        # tell); bound it to a laptop range and keep the preset's core count.
+        "screen": Screen(min_width=1280, min_height=720, max_width=1920, max_height=1080),
+        "window": (1366, 768),
+        "pin_cpu_cores": True,
+        "enable_cache": True,
     }
     proxy_cfg = _proxy_dict(proxy)
     if proxy_cfg:
@@ -145,6 +206,7 @@ def register_with_browser(
         try:
             page.goto("https://deepai.org/", wait_until="domcontentloaded", timeout=90_000)
             say("browser: homepage loaded")
+            _warm_up(page, rng)
 
             opened = page.evaluate(OPEN_DIALOG_JS)
             page.wait_for_timeout(rng.randint(600, 1400))
@@ -158,10 +220,11 @@ def register_with_browser(
                 ("#confirm-user-password", password),
             ):
                 locator = page.locator(selector).first
-                locator.click()
+                _human_click(page, locator, rng)
                 locator.fill("")
-                page.keyboard.type(value, delay=rng.randint(35, 90))
-                page.wait_for_timeout(rng.randint(150, 500))
+                page.wait_for_timeout(rng.randint(90, 260))
+                _human_type(page, value, rng)
+                page.wait_for_timeout(rng.randint(180, 520))
 
             state = page.evaluate(TURNSTILE_STATE_JS)
             if state.get("widget") and not state.get("token"):
@@ -186,8 +249,18 @@ def register_with_browser(
                         page.evaluate(INJECT_JS, {"token": token, "field": "cf-turnstile-response"})
                         say("browser: injected solved captcha token")
 
-            submitted = page.evaluate(SUBMIT_JS)
+            submitted = "none"
+            try:
+                button = page.locator("dialog[open] button").filter(has_text=re.compile(r"sign\s*up|create", re.I)).first
+                if button.count() > 0:
+                    _human_click(page, button, rng)
+                    submitted = "human-click"
+            except Exception:  # noqa: BLE001 - locator strategy is best-effort
+                submitted = "none"
+            if submitted == "none":
+                submitted = page.evaluate(SUBMIT_JS)
             say(f"browser: submit via {submitted}")
+            page.mouse.move(rng.randint(200, 1000), rng.randint(120, 520), steps=rng.randint(3, 7))
 
             # Success condition is the session, not the dialog: a post-signup promo
             # dialog may stay open, so poll the profile endpoint instead.

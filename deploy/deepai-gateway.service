@@ -1,0 +1,29 @@
+[Unit]
+Description=DeepAI Code gateway (account pool + OpenAI/Anthropic surface)
+Documentation=https://github.com/addxiaoyi/deepai2api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepai
+Group=deepai
+WorkingDirectory=/opt/deepai2api
+EnvironmentFile=/etc/deepai2api/env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node src/index.mjs --host ${DEEPAI_GATEWAY_HOST} --port ${DEEPAI_GATEWAY_PORT} --token ${DEEPAI_GATEWAY_TOKEN} --data ${DEEPAI_GATEWAY_DATA}
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+
+# The bulk-signup worker writes its SQLite/journal next to the code and exports
+# under the tool directory, so both trees stay writable for this user.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/deepai2api /var/lib/deepai2api
+
+[Install]
+WantedBy=multi-user.target

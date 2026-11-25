@@ -1,0 +1,20 @@
+[Unit]
+Description=DeepAI Code WebUI (Open WebUI fork)
+Documentation=https://github.com/addxiaoyi/deepai2api
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/deepai2api
+EnvironmentFile=/etc/deepai2api/env
+ExecStart=/usr/bin/docker compose -f /opt/deepai2api/docker-compose.yml up --remove-orphans
+ExecStop=/usr/bin/docker compose -f /opt/deepai2api/docker-compose.yml down
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

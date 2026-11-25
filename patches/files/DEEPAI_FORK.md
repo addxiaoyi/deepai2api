@@ -66,9 +66,11 @@ All require an Open WebUI **admin** session (`get_admin_user`).
 | `POST /api/v1/deepai/keys/{id}/revoke` · `DELETE /api/v1/deepai/keys/{id}` | Revoke / delete |
 | `POST /api/v1/deepai/connect` | Mint a key and register the gateway as an OpenAI connection |
 | `GET /api/v1/deepai/models` | Catalog with per-request prices |
-| `GET /api/v1/deepai/register` | Bulk-signup job: status, counters, last 80 log lines, domain scorecard |
-| `POST /api/v1/deepai/register` | Start a job (`count`, `engine`, `concurrency`, `mail_provider`, `mail_domains`, `proxies`) |
+| `GET /api/v1/deepai/register` | Bulk-signup job: status, counters, **progress/ETA**, failure reasons, last 240 log lines |
+| `POST /api/v1/deepai/register` | Start a job (`count`, `engine`, `concurrency`, `mail_provider`, `mail_domains`, `proxies`, `retry_rounds`) |
 | `POST /api/v1/deepai/register/stop` | Kill the running job (whole process tree on Windows) |
+| `GET /api/v1/deepai/register/log` | Log tail filtered by `level`, or `download=1` for a `.log` attachment |
+| `GET /api/v1/deepai/register/domains` | Domain scorecard from the worker's SQLite (30 s cache) |
 
 ## Bulk signup panel
 
@@ -97,6 +99,35 @@ WebUI panel ──POST /register──▶ deepai.py ──POST /api/admin/regist
   next run starts from the survivors.
 * The job snapshot is persisted to `data/register-job.json`; a gateway restart
   shows the last run as `interrupted` instead of pretending it is still going.
+* Progress is `settled / requested` where a unit settles when it is created or
+  has exhausted the retry rounds; ETA is `remaining / (settled / elapsed)`.
+  The panel renders it as a bar plus "预计剩余 N 分 N 秒 · x 个/分".
+* Failed units get one extra pass (`--retry-rounds`, default 1) with a fresh
+  persona/domain/proxy, and every give-up is written to the `failures` table
+  with a `kind` (`email_rejected` / `blocked` / `rate_limited` / `no_api_key` /
+  `transport` / …), aggregated for the panel and the job summary.
+* Log levels are `debug|info|warn|error`; the panel filters client-side for
+  instant feedback and calls `/register/log?download=1` for the export so the
+  operator gets the full buffer, not the 240-line ring.
+
+## Poe pool (separate)
+
+Poe accounts live in `data/poe-pool.json`, never in `accounts[]`: their credential
+is a `p-b` cookie and their life cycle (`email_verified` -> `phone_required` ->
+`active` -> `dead`) has nothing in common with an API key. The same settings page
+renders a second card that talks to these routes (proxied to the gateway):
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/v1/deepai/poe/accounts` | Pool list with cookie **names** only (values never leave the gateway) |
+| `DELETE /api/v1/deepai/poe/accounts/{id}` | Drop an account |
+| `POST /api/v1/deepai/poe/accounts/status` | Operator override (`active` / `dead`) |
+| `GET/POST /api/v1/deepai/poe/register` | Status / start (`count`, `engine`, `mail_provider`, `sms_provider`) |
+| `POST /api/v1/deepai/poe/register/stop` | Stop the worker |
+| `GET /api/v1/deepai/poe/register/log` | Log tail, `download=1` for a file |
+
+The worker (`tools/poe-reg`) pushes each account to `POST /api/poe/accounts`; the
+gateway masks the cookie jar in every response.
 
 ## Build
 

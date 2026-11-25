@@ -29,6 +29,7 @@ def _config_from(args: argparse.Namespace, extra: dict | None = None) -> Config:
         "count": getattr(args, "count", None),
         "concurrency": getattr(args, "concurrency", None),
         "attempts": getattr(args, "attempts", None),
+        "retry_rounds": getattr(args, "retry_rounds", None),
         "output_dir": Path(args.out) if getattr(args, "out", None) else None,
         "mail_provider": getattr(args, "mail_provider", None),
         "mail_domain": getattr(args, "mail_domain", None),
@@ -84,7 +85,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         runner = Runner(cfg, store, on_event=on_event, quiet=args.json)
-        summary = runner.run(args.count)
+        try:
+            summary = runner.run(args.count)
+        finally:
+            runner.close()
         if args.json:
             return 0 if summary["created"] else 1
         print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -127,15 +131,21 @@ def cmd_browser_check(args: argparse.Namespace) -> int:
     """Launch Camoufox with the same options the engine uses and report the identity."""
     cfg = _config_from(args)
     from camoufox.sync_api import Camoufox
+    from camoufox.fingerprints import Screen
 
     proxy = cfg.proxies[0] if cfg.proxies else ""
     launch: dict = {
         "headless": not args.headful,
-        "humanize": True,
+        "humanize": 2.2,
         "os": ["windows"],
         "locale": [cfg.language],
         "geoip": bool(cfg.geoip and proxy),
         "block_webrtc": True,
+        "fingerprint_preset": True,
+        "screen": Screen(min_width=1280, min_height=720, max_width=1920, max_height=1080),
+        "window": (1366, 768),
+        "pin_cpu_cores": True,
+        "enable_cache": True,
     }
     if proxy:
         launch["proxy"] = _proxy_dict(proxy)
@@ -174,6 +184,30 @@ def cmd_browser_check(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+def cmd_domains(args: argparse.Namespace) -> int:
+    """Scorecard for the WebUI chart; also handy as `deepai_reg domains`."""
+    from .mail_pool import DomainPool
+
+    cfg = _config_from(args)
+    pool = DomainPool(cfg.db_path)
+    try:
+        rows = pool.rows(getattr(args, "mail_provider", "") or "")
+    finally:
+        pool.close()
+    if args.json:
+        print(json.dumps({"ok": True, "domains": rows}, ensure_ascii=False), flush=True)
+        return 0
+    if not rows:
+        print("还没有域名战绩；跑一轮注册就会积累。")
+        return 0
+    total_ok = sum(r["ok_count"] for r in rows)
+    print(f"{'域名':<34}{'provider':<15}{'成功':>6}{'失败':>6}")
+    for row in rows:
+        print(f"{row['domain']:<34}{row['provider']:<15}{row['ok_count']:>6}{row['bad_count']:>6}")
+    print(f"{'合计':<49}{total_ok:>6}")
     return 0
 
 
@@ -226,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--engine", choices=["protocol", "browser", "auto"], default="auto")
     run.add_argument("--concurrency", type=int, default=2)
     run.add_argument("--attempts", type=int, default=3)
+    run.add_argument("--retry-rounds", type=int, default=None, help="re-run the failed units N extra rounds")
     run.add_argument("--headful", action="store_true", help="show the Camoufox window")
     run.add_argument("--no-verify", action="store_true", help="skip mailbox polling")
     run.add_argument("--mail-domains", action="append", help="domain rotation pool, repeatable or comma separated")
@@ -253,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     shared(listing)
     listing.add_argument("--limit", type=int, default=20)
     listing.set_defaults(func=cmd_list)
+
+    domains = sub.add_parser("domains", help="mail-domain scorecard (ok/bad per domain)")
+    shared(domains)
+    domains.add_argument("--json", action="store_true")
+    domains.set_defaults(func=cmd_domains)
 
     export = sub.add_parser("export", help="write JSONL/CSV for the gateway")
     shared(export)

@@ -16,7 +16,7 @@ import logging
 from typing import Optional
 
 import aiohttp
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from open_webui.models.config import Config
@@ -106,6 +106,25 @@ async def gw(path: str, method: str = "GET", json_body=None, timeout: int = 60):
             "还没配置网关管理口令。在下方填入（网关启动时打印的那个 token），或设置环境变量 DEEPAI_GATEWAY_TOKEN。",
         )
     return await gateway_request(method, path, json_body=json_body, token=token, timeout=timeout)
+
+
+async def gw_raw(path: str, timeout: int = 60):
+    """Binary/text passthrough (log downloads)."""
+    base = await get_gateway_url()
+    token = await admin_headers_token()
+    if not token:
+        raise GatewayError(400, "还没配置网关管理口令。")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(
+                f"{base}{path}", headers={"Authorization": f"Bearer {token}", "Accept": "*/*"}
+            ) as response:
+                body = await response.read()
+                if response.status >= 400:
+                    raise GatewayError(response.status, body.decode("utf-8", "replace")[:300])
+                return body, response.headers.get("content-type", "text/plain; charset=utf-8")
+    except aiohttp.ClientConnectorError as exc:
+        raise GatewayError(503, f"连不上 DeepAI 网关（{base}）。") from exc
 
 
 # --------------------------------------------------------------------- models
@@ -299,6 +318,99 @@ async def register_start(form_data: RegisterForm, user=Depends(get_admin_user)):
 @router.post("/register/stop")
 async def register_stop(user=Depends(get_admin_user)):
     return await gw("/api/admin/register/stop", method="POST", timeout=30)
+
+
+@router.get("/register/log")
+async def register_log(
+    level: str = "",
+    limit: int = 120,
+    download: int = 0,
+    user=Depends(get_admin_user),
+):
+    """Filtered log tail; `download=1` returns a text file instead of JSON."""
+    query = f"?level={level}&limit={limit}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/register/log{query}")
+        filename = f"deepai-register-{level or 'all'}.log"
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return await gw(f"/api/admin/register/log{query}")
+
+
+@router.get("/register/domains")
+async def register_domains(force: int = 0, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/register/domains?force={1 if force else 0}", timeout=40)
+
+
+# ------------------------------------------------------------------- poe pool
+#
+# Poe accounts are cookie jars with their own life cycle, kept in a pool file
+# next to (not inside) the DeepAI account list. These routes are a thin proxy.
+
+
+class PoeRegisterForm(BaseModel):
+    count: int = 1
+    engine: str = "auto"
+    concurrency: int = 1
+    mail_provider: str = "tempmail_lol"
+    mail_domains: list[str] = []
+    sms_provider: str = "off"
+    headless: bool = True
+
+
+@router.get("/poe/accounts")
+async def poe_accounts(limit: int = 100, user=Depends(get_admin_user)):
+    return await gw(f"/api/poe/accounts?limit={limit}", timeout=30)
+
+
+@router.delete("/poe/accounts/{account_id}")
+async def poe_account_delete(account_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/poe/accounts/{account_id}", method="DELETE", timeout=30)
+
+
+@router.post("/poe/accounts/status")
+async def poe_account_status(form_data: dict, user=Depends(get_admin_user)):
+    return await gw("/api/poe/accounts/status", method="POST", json_body=form_data, timeout=30)
+
+
+@router.get("/poe/register")
+async def poe_register_status(user=Depends(get_admin_user)):
+    return await gw("/api/poe/register", timeout=30)
+
+
+@router.post("/poe/register")
+async def poe_register_start(form_data: PoeRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "engine": form_data.engine,
+        "concurrency": form_data.concurrency,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "smsProvider": form_data.sms_provider,
+        "headless": form_data.headless,
+    }
+    return await gw("/api/poe/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/poe/register/stop")
+async def poe_register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/poe/register/stop", method="POST", timeout=30)
+
+
+@router.get("/poe/register/log")
+async def poe_register_log(level: str = "", limit: int = 120, download: int = 0, user=Depends(get_admin_user)):
+    query = f"?level={level}&limit={limit}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/poe/register/log{query}")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="poe-register-{level or "all"}.log"'},
+        )
+    return await gw(f"/api/poe/register/log{query}")
 
 
 # ------------------------------------------------------------------ api keys

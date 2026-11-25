@@ -1,0 +1,43 @@
+mail:
+  provider: tempmail_lol  # tempmail_lol | mailtm | imap | fixed
+  domain: ""             # preferred domain if provider supports it
+  domains: []            # rotation pool
+  # fixed provider:
+  address: ""
+  # imap provider:
+  imap_host: ""
+  imap_port: 993
+  imap_user: ""
+  imap_password: ""
+  prefix: ""
+  verify_timeout: 180
+
+captcha:
+  provider: none         # none | browser | manual
+  api_key: ""            # manual: token
+  action: signup
+  timeout: 120
+
+browser:
+  stack: auto            # auto | camoufox | playwright
+  headless: true
+  cdp: ""                # external CDP e.g. http://127.0.0.1:50325
+  humanize: 1.0
+  geoip: true
+  turnstile_timeout: 50
+  screenshots: true
+
+base_url: "https://gab.ai"
+engine: auto
+count: 5
+concurrency: 2
+attempts: 3
+retry_rounds: 1
+verify_email: false
+create_api_key: true
+
+# optional proxies:
+proxies: []
+proxy_rotate: true
+
+output_dir: out

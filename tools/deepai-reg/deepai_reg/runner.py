@@ -43,6 +43,12 @@ class Runner:
         self._counter_lock = threading.Lock()
 
     # ------------------------------------------------------------------ utils
+    def close(self) -> None:
+        """Release the domain scorecard handle (SQLite keeps the file locked)."""
+        if self.pool is not None:
+            self.pool.close()
+            self.pool = None
+
     def emit(self, event: dict[str, Any]) -> None:
         if not self.on_event:
             return
@@ -93,6 +99,8 @@ class Runner:
         started = time.time()
         created: list[dict[str, Any]] = []
         failures: list[str] = []
+        pending = list(range(target))
+        retries = 0
 
         self.emit(
             {
@@ -103,16 +111,18 @@ class Runner:
                 "mail_provider": self.cfg.mail.provider,
                 "mail_domains": list(self.cfg.mail.domains),
                 "proxies": len(self.cfg.proxies),
+                "retry_rounds": self.cfg.retry_rounds,
             }
         )
         self.log(
-            "start engine=%s count=%d concurrency=%d proxies=%d mail=%s"
+            "start engine=%s count=%d concurrency=%d proxies=%d mail=%s retries=%d"
             % (
                 self.cfg.engine,
                 target,
                 self.cfg.concurrency,
                 len(self.cfg.proxies),
                 self.cfg.mail.provider,
+                self.cfg.retry_rounds,
             )
         )
         if self.cfg.proxies and self.cfg.concurrency > len(self.cfg.proxies):
@@ -122,20 +132,37 @@ class Runner:
                 level="warn",
             )
 
-        with ThreadPoolExecutor(max_workers=max(1, self.cfg.concurrency)) as pool:
-            futures = {pool.submit(self.signup, index): index for index in range(target)}
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    account = future.result()
-                    created.append(account)
-                    self.log(
-                        f"#{index + 1} ok {account['email']} key={account['api_key'][:8]}… "
-                        f"({self.store.count()} total)"
-                    )
-                except Exception as exc:  # noqa: BLE001 - reported, never fatal
-                    failures.append(f"#{index + 1} {type(exc).__name__}: {exc}")
-                    self.log(f"#{index + 1} failed {type(exc).__name__}: {exc}", level="error")
+        for round_no in range(self.cfg.retry_rounds + 1):
+            if not pending:
+                break
+            if round_no:
+                retries += len(pending)
+                self.emit({"type": "retry", "round": round_no, "count": len(pending)})
+                self.log(
+                    f"retry round {round_no}/{self.cfg.retry_rounds}: {len(pending)} account(s) "
+                    "with fresh persona/domain/proxy",
+                    level="warn",
+                )
+                failures.clear()
+                self._sleep(3, 7)
+
+            still_failing: list[int] = []
+            with ThreadPoolExecutor(max_workers=max(1, self.cfg.concurrency)) as pool:
+                futures = {pool.submit(self.signup, index, round_no): index for index in pending}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        account = future.result()
+                        created.append(account)
+                        self.log(
+                            f"#{index + 1} ok {account['email']} key={account['api_key'][:8]}… "
+                            f"({self.store.count()} total)"
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                        still_failing.append(index)
+                        failures.append(f"#{index + 1} {type(exc).__name__}: {exc}")
+                        self.log(f"#{index + 1} failed {type(exc).__name__}: {exc}", level="error")
+            pending = sorted(still_failing)
 
         jsonl = self.cfg.output_dir / "accounts.jsonl"
         csv_path = self.cfg.output_dir / "accounts.csv"
@@ -145,13 +172,15 @@ class Runner:
         summary = {
             "requested": target,
             "created": len(created),
-            "failed": len(failures),
+            "failed": len(pending),
+            "retries": retries,
             "stored": self.store.count(),
             "seconds": round(time.time() - started, 1),
             "jsonl": str(jsonl),
             "csv": str(csv_path),
             "jsonl_rows": exported_jsonl,
             "failures": failures,
+            "failure_reasons": self.store.failure_summary(),
             "mail_domains": self.pool.rows() if self.pool else [],
         }
         self.emit({"type": "done", "summary": summary})
@@ -162,7 +191,7 @@ class Runner:
         return summary
 
     # --------------------------------------------------------------- one unit
-    def signup(self, index: int) -> dict[str, Any]:
+    def signup(self, index: int, round_no: int = 0) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(1, self.cfg.attempts + 1):
             persona = make_persona(random.Random())
@@ -258,7 +287,29 @@ class Runner:
                 if attempt < self.cfg.attempts:
                     self._sleep(*self.cfg.delay)
 
-        raise last_error or SignupError("signup failed without a recorded cause")
+        kind = getattr(last_error, "kind", "error") if last_error else "unknown"
+        reason = str(last_error) if last_error else "signup failed without a recorded cause"
+        self.store.record_failure(
+            email=email,
+            domain=domain,
+            engine=engine,
+            proxy=proxy,
+            kind=str(kind),
+            reason=reason,
+            round_no=round_no,
+        )
+        self.emit(
+            {
+                "type": "failed",
+                "index": index + 1,
+                "email": email,
+                "domain": domain,
+                "kind": str(kind),
+                "reason": reason,
+                "round": round_no,
+            }
+        )
+        raise last_error or SignupError(reason)
 
     # ------------------------------------------------------------- internals
     def _protocol_signup(

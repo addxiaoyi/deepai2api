@@ -220,8 +220,13 @@ class MailTm(Provider):
         listing = request(self.client, "GET", f"{MAILTM_API}/messages", headers=headers)
         if listing.status_code >= 400:
             return []
+        payload = listing.json() or []
+        if isinstance(payload, dict):  # error body / hydra wrapper
+            payload = payload.get("hydra:member") or []
         out: list[Message] = []
-        for item in listing.json() or []:
+        for item in payload:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
             detail = request(
                 self.client, "GET", f"{MAILTM_API}/messages/{item['id']}", headers=headers
             )

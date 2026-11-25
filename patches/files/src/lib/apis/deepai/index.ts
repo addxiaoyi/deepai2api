@@ -106,3 +106,67 @@ export const startDeepAIRegister = async (token: string = '', options: RegisterO
 
 export const stopDeepAIRegister = async (token: string = '') =>
 	request(token, '/register/stop', { method: 'POST' });
+
+export const getDeepAIRegisterLog = async (token: string = '', level: string = '', limit: number = 120) =>
+	request(token, `/register/log?level=${encodeURIComponent(level)}&limit=${limit}`);
+
+export const getDeepAIRegisterDomains = async (token: string = '', force: boolean = false) =>
+	request(token, `/register/domains${force ? '?force=1' : ''}`);
+
+export const downloadDeepAIRegisterLog = async (token: string = '', level: string = '') => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/register/log?download=1&level=${encodeURIComponent(level)}`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+// ------------------------------------------------------------------ poe pool
+
+export type PoeRegisterOptions = {
+	count: number;
+	engine: 'auto' | 'protocol' | 'browser';
+	concurrency: number;
+	mailProvider: 'tempmail_lol' | 'mailtm' | 'imap' | 'fixed';
+	mailDomains: string[];
+	smsProvider: 'off' | 'manual' | 'sms_activate' | 'smspool';
+	headless: boolean;
+};
+
+export const getPoeAccounts = async (token: string = '', limit: number = 100) =>
+	request(token, `/poe/accounts?limit=${limit}`);
+
+export const deletePoeAccount = async (token: string = '', id: string) =>
+	request(token, `/poe/accounts/${id}`, { method: 'DELETE' });
+
+export const setPoeAccountStatus = async (token: string = '', email: string, status: string) =>
+	request(token, '/poe/accounts/status', { method: 'POST', body: JSON.stringify({ email, status }) });
+
+export const getPoeRegister = async (token: string = '') => request(token, '/poe/register');
+
+export const startPoeRegister = async (token: string = '', options: PoeRegisterOptions) =>
+	request(token, '/poe/register', {
+		method: 'POST',
+		body: JSON.stringify({
+			count: options.count,
+			engine: options.engine,
+			concurrency: options.concurrency,
+			mail_provider: options.mailProvider,
+			mail_domains: options.mailDomains,
+			sms_provider: options.smsProvider,
+			headless: options.headless
+		})
+	});
+
+export const stopPoeRegister = async (token: string = '') =>
+	request(token, '/poe/register/stop', { method: 'POST' });
+
+export const downloadPoeLog = async (token: string = '', level: string = '') => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/poe/register/log?download=1&level=${encodeURIComponent(level)}`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};

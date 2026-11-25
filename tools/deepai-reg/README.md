@@ -185,9 +185,21 @@ node ../../tools/deepai-reg/scripts/import-to-gateway.mjs out/accounts.jsonl --d
 | 接口 | 作用 |
 | --- | --- |
 | `POST /api/admin/accounts` | 入池一个账号 `{apiKey, username, isPro, label}`，按 apiKey 幂等 |
-| `GET /api/admin/register` | 当前任务快照：状态、计数、当前邮箱、最近 80 行日志、域名战绩 |
-| `POST /api/admin/register` | 起任务 `{count, engine, concurrency, mailProvider, mailDomains[], proxies[]}` |
+| `GET /api/admin/register` | 任务快照：状态、计数、**进度/ETA**、当前邮箱、`failureReasons`、最近 240 行日志、域名战绩 |
+| `POST /api/admin/register` | 起任务 `{count, engine, concurrency, mailProvider, mailDomains[], proxies[], retryRounds}` |
 | `POST /api/admin/register/stop` | 停任务（Windows 上整棵进程树 taskkill） |
+| `GET /api/admin/register/log?level=&limit=&download=1` | 按级别取日志尾；`download=1` 直接下 `.log` |
+| `GET /api/admin/register/domains?force=1` | 域名战绩（现跑 `deepai_reg domains --json`，缓存 30 s） |
+
+### 面板能看到的
+
+| 能力 | 实现 |
+| --- | --- |
+| 进度条 + 预计剩余 | 网关按 `settled/requested` 与吞吐算 `progress.ratio`、`etaSeconds`、`ratePerMinute`，面板每 2.5 s 刷新 |
+| 失败自动重试 | worker 先跑一轮，失败的单元进入 `--retry-rounds`（默认 1）重跑，**换 persona / 域名 / 代理**；`retry` 事件在日志里单列 |
+| 失败原因留档 | `failures` 表记 `kind`（`email_rejected`/`blocked`/`rate_limited`/`no_api_key`/`transport`…）+ 原文，面板聚合展示 |
+| 日志按级别筛选/导出 | 面板 chips（全部/info/warn/error/debug）+「导出日志」下载 `deepai-register-<level>.log` |
+| 域名可视化 | 每个域一条绿/红双色条（成功/失败），数据来自成绩表，可手动「刷新域名」 |
 
 ### 邮箱域名自动学习
 
@@ -196,7 +208,22 @@ node ../../tools/deepai-reg/scripts/import-to-gateway.mjs out/accounts.jsonl --d
 - 成功 → `ok_count += 1`，下轮优先用（`_domains_for` 先排已知可用的域）；
 - 被 DeepAI 拒（`Please use your own email address.`）→ `bad_count += 1`，只有失败记录的域被“停放”，不再白试；
 - `mailtm` 每次还会拉 `/domains` 现取活跃域，和人工填的 `--mail-domains` 合并；
-- 两个免费邮箱 API 同时开盒都会 429，所以开盒做了全局节流（1.5 s）+ 429 退避重试。
+- 两个免费邮箱 API 同时开盒都会 429，所以开盒做了全局节流（1.5 s）+ 429 退避重试；
+- 随时看战绩：`python -m deepai_reg domains`（`--json` 给面板用）。
+
+### 指纹更像真人（`browser` 引擎）
+
+| 做法 | 为什么 |
+| --- | --- |
+| `fingerprint_preset=True` | 用内置真机档（屏幕/字体/WebGL/语音成套），不是 fpgen 拼的合成指纹 |
+| `screen=1280×720..1920×1080` + `window=1366×768` | 无头模式默认报 1088×612，是个明显破绽 |
+| `pin_cpu_cores=True` | `hardwareConcurrency` 跟指纹一致（16 核），不暴露宿主 32 核 |
+| `humanize=2.2` | 鼠标轨迹用贝塞尔式缓动，不是瞬移 |
+| 自写 `_human_click` / `_human_type` | 先靠近、微调、再落下；逐字符 38–118 ms，偶发 160–420 ms 停顿 |
+| `_warm_up` | 进站先晃动鼠标、上下滚一段，像真人在读页面 |
+| `geoip=True` + 代理 | 时区/语言/经纬度跟出口 IP 对齐（实测落到 `America/New_York`） |
+
+实测（2026-11-25）：`browser` 引擎连跑 2 个号 **2/2 成功**，`submit via human-click`，单号 ~40 s。
 
 > 新号 `plan=free`、`locked_out_due_to_no_payment_info=true`：
 > 池子里只是"能登录的账号"，能不能真跑通 `deepai_code` 付费通道，取决于该账号有没有订阅。

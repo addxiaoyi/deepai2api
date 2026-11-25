@@ -56,6 +56,7 @@ class Config:
     count: int = 1
     concurrency: int = 2
     attempts: int = 3
+    retry_rounds: int = 1            # after the first pass, re-run just the failures
     delay: tuple[float, float] = (4.0, 9.0)
     timeout: float = 45.0
     headless: bool = True
@@ -86,6 +87,7 @@ class Config:
             count=int(data.get("count", base.count)),
             concurrency=int(data.get("concurrency", base.concurrency)),
             attempts=int(data.get("attempts", base.attempts)),
+            retry_rounds=int(data.get("retry_rounds", base.retry_rounds)),
             timeout=float(data.get("timeout", base.timeout)),
             headless=bool(data.get("headless", base.headless)),
             language=str(data.get("language", base.language)),
@@ -179,6 +181,7 @@ class Config:
             "count": self.count,
             "concurrency": self.concurrency,
             "attempts": self.attempts,
+            "retry_rounds": self.retry_rounds,
             "delay": self.delay,
             "proxies": len(self.proxies),
             "mail_provider": self.mail.provider,

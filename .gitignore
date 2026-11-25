@@ -29,8 +29,21 @@ vendor/open-webui/.venv/
 .DS_Store
 Thumbs.db
 # 注册机产物（含账号密码与 api_key）
-tools/deepai-reg/out/
-tools/deepai-reg/config.yaml
+tools/*/out/
+tools/*/screenshots/
+tools/*/accounts.*
+tools/*/*.png
+tools/*/run.log
+tools/*/config.yaml
+tools/*/_raw/
+tools/*/.pytest_cache/
+tools/*/out-live/
+
+# 本地临时/调试目录（沙箱 ACL 报告、抓包、下载缓存）
+/tmp/
+/_aclfix/
+/out/
+_writetest.txt
 tools/allmodels-reg/out/
 tools/allmodels-reg/config.yaml
 data/exports/
@@ -38,4 +51,8 @@ data/exports/
 # Python
 __pycache__/
 *.pyc
+
+
+# 内含明文 API key 的抓包脚本：脱敏后再入库
+probe/cleverai/
 

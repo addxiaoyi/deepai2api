@@ -21,7 +21,17 @@
 		connectDeepAIToOpenWebUI,
 		getDeepAIRegister,
 		startDeepAIRegister,
-		stopDeepAIRegister
+		stopDeepAIRegister,
+		getDeepAIRegisterLog,
+		getDeepAIRegisterDomains,
+		downloadDeepAIRegisterLog,
+		getPoeAccounts,
+		deletePoeAccount,
+		setPoeAccountStatus,
+		getPoeRegister,
+		startPoeRegister,
+		stopPoeRegister,
+		downloadPoeLog
 	} from '$lib/apis/deepai';
 
 	const i18n: any = getContext('i18n');
@@ -196,12 +206,83 @@
 	let regDomains = '';
 	let regProxies = '';
 
+	let logLevel: '' | 'debug' | 'info' | 'warn' | 'error' = '';
+	let domainsPayload: any = null;
+	let exporting = false;
+
 	const job = () => register?.job ?? null;
 	const splitTokens = (raw: string) =>
 		raw
 			.split(/[\s,;]+/)
 			.map((s) => s.trim())
 			.filter(Boolean);
+
+	const progress = () => job()?.progress ?? { ratio: 0, settled: 0, requested: 0, etaSeconds: null };
+	const progressPct = () => Math.max(0, Math.min(100, Math.round((progress().ratio ?? 0) * 100)));
+
+	const formatDuration = (seconds: number | null | undefined) => {
+		if (seconds === null || seconds === undefined) return '—';
+		const total = Math.max(0, Math.round(seconds));
+		const minutes = Math.floor(total / 60);
+		const rest = total % 60;
+		return minutes > 0 ? `${minutes} 分 ${rest} 秒` : `${rest} 秒`;
+	};
+
+	const visibleLines = () => {
+		const lines = job()?.lines ?? [];
+		const filtered = logLevel ? lines.filter((line: any) => line.level === logLevel) : lines;
+		return filtered.slice(-120);
+	};
+
+	// ok/bad per domain, biggest first, for the little bar chart
+	const chartRows = () => {
+		const rows = domainsPayload?.domains ?? job()?.domainStats ?? [];
+		return [...rows]
+			.map((row: any) => ({
+				domain: row.domain,
+				provider: row.provider,
+				ok: Number(row.ok_count ?? 0),
+				bad: Number(row.bad_count ?? 0)
+			}))
+			.filter((row) => row.ok + row.bad > 0)
+			.sort((a, b) => b.ok + b.bad - (a.ok + a.bad))
+			.slice(0, 12);
+	};
+	const chartMax = () => Math.max(1, ...chartRows().map((row) => row.ok + row.bad));
+
+	async function loadDomains(force = false) {
+		try {
+			domainsPayload = await getDeepAIRegisterDomains(token(), force);
+		} catch (err) {
+			console.error(err);
+		}
+	}
+
+	async function refreshLog() {
+		try {
+			const res = await getDeepAIRegisterLog(token(), logLevel, 120);
+			if (register?.job) register.job.lines = res?.lines ?? register.job.lines;
+		} catch (err) {
+			console.error(err);
+		}
+	}
+
+	async function exportLog() {
+		exporting = true;
+		try {
+			const blob = await downloadDeepAIRegisterLog(token(), logLevel);
+			const url = URL.createObjectURL(blob);
+			const anchor = document.createElement('a');
+			anchor.href = url;
+			anchor.download = `deepai-register-${logLevel || 'all'}.log`;
+			anchor.click();
+			URL.revokeObjectURL(url);
+			toast.success('日志已导出');
+		} catch (err: any) {
+			toast.error(err?.message ?? '导出失败');
+		}
+		exporting = false;
+	}
 
 	async function loadRegister() {
 		try {
@@ -222,6 +303,7 @@
 				toast.success(`批量注册结束：新增 ${created} 个账号`);
 				await load();
 			}
+			await loadDomains(true);
 		}
 		wasRunning = running;
 	}
@@ -275,8 +357,137 @@
 	onMount(() => {
 		load();
 		loadRegister();
+		loadDomains();
+		loadPoe();
 	});
-	onDestroy(stopPoller);
+	onDestroy(() => {
+		stopPoller();
+		stopPoePoller();
+	});
+
+	// ------------------------------------------------------------- poe pool
+	//
+	// Poe is a separate pool with its own life cycle. Worth knowing before
+	// reading the numbers: with no SMS provider every account stops at
+	// email_verified/phone_required — Poe refuses to create the account until a
+	// phone was verified recently. That is a Poe rule, not a bug here.
+
+	let poe: any = null;
+	let poeAccounts: any[] = [];
+	let poeCounts: any = {};
+	let poeTimer: any = null;
+	let poeWasRunning = false;
+	let poeCount = 1;
+	let poeEngine: 'auto' | 'protocol' | 'browser' = 'protocol';
+	let poeMail: 'tempmail_lol' | 'mailtm' | 'imap' | 'fixed' = 'tempmail_lol';
+	let poeSms: 'off' | 'manual' | 'sms_activate' | 'smspool' = 'off';
+
+	const poeJob = () => poe?.job ?? null;
+	const poePct = () =>
+		Math.max(0, Math.min(100, Math.round((poeJob()?.progress?.ratio ?? 0) * 100)));
+
+	async function loadPoe() {
+		try {
+			const [job, pool] = await Promise.all([getPoeRegister(token()), getPoeAccounts(token(), 100)]);
+			poe = job;
+			poeAccounts = pool?.accounts ?? [];
+			poeCounts = pool?.counts ?? {};
+			const running = job?.running === true;
+			if (running) {
+				ensurePoePoller();
+			} else if (poeWasRunning) {
+				stopPoePoller();
+				if ((poeJob()?.created ?? 0) > 0) toast.success('Poe 注册结束，账号已进独立号池');
+			}
+			poeWasRunning = running;
+		} catch (err) {
+			console.error(err);
+		}
+	}
+
+	function ensurePoePoller() {
+		if (poeTimer) return;
+		poeTimer = setInterval(loadPoe, 3000);
+	}
+
+	function stopPoePoller() {
+		if (!poeTimer) return;
+		clearInterval(poeTimer);
+		poeTimer = null;
+	}
+
+	async function startPoe() {
+		busy = 'poe-start';
+		try {
+			poe = await startPoeRegister(token(), {
+				count: Number(poeCount) || 1,
+				engine: poeEngine,
+				concurrency: 1,
+				mailProvider: poeMail,
+				mailDomains: [],
+				smsProvider: poeSms,
+				headless: true
+			});
+			poeWasRunning = true;
+			ensurePoePoller();
+			toast.success('Poe 注册已开始');
+		} catch (err: any) {
+			toast.error(err?.message ?? '启动失败');
+		}
+		busy = '';
+	}
+
+	async function stopPoe() {
+		busy = 'poe-stop';
+		try {
+			poe = await stopPoeRegister(token());
+			stopPoePoller();
+			poeWasRunning = false;
+			toast.success('已请求停止');
+		} catch (err: any) {
+			toast.error(err?.message ?? '停止失败');
+		}
+		busy = '';
+	}
+
+	async function removePoe(account: any) {
+		if (!confirm(`移除 Poe 账号 ${account.email}？`)) return;
+		busy = 'poe-' + account.id;
+		try {
+			await deletePoeAccount(token(), account.id);
+			toast.success('已移除');
+			await loadPoe();
+		} catch (err: any) {
+			toast.error(err?.message ?? '移除失败');
+		}
+		busy = '';
+	}
+
+	async function markPoe(account: any, status: string) {
+		busy = 'poe-' + account.id;
+		try {
+			await setPoeAccountStatus(token(), account.email, status);
+			await loadPoe();
+		} catch (err: any) {
+			toast.error(err?.message ?? '状态更新失败');
+		}
+		busy = '';
+	}
+
+	async function exportPoeLog() {
+		try {
+			const blob = await downloadPoeLog(token(), '');
+			const url = URL.createObjectURL(blob);
+			const anchor = document.createElement('a');
+			anchor.href = url;
+			anchor.download = 'poe-register.log';
+			anchor.click();
+			URL.revokeObjectURL(url);
+			toast.success('日志已导出');
+		} catch (err: any) {
+			toast.error(err?.message ?? '导出失败');
+		}
+	}
 </script>
 
 <div class="flex flex-col gap-5 text-sm">
@@ -528,36 +739,301 @@
 			{/if}
 		</div>
 
+		{#if job()}
+			<div class="mt-3">
+				<div class="mb-1 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+					<span>
+						进度 {progress().settled ?? 0}/{progress().requested ?? 0}（{progressPct()}%）
+						{#if job().retrying}
+							· 第 {job().retryRound} 轮重试 {job().retrying} 个
+						{/if}
+					</span>
+					<span>
+						{#if register?.running}
+							预计剩余 {formatDuration(progress().etaSeconds)} · {progress().ratePerMinute ?? 0} 个/分
+						{:else}
+							用时 {formatDuration(job().progress?.elapsedSeconds ?? job().summary?.seconds)}
+						{/if}
+					</span>
+				</div>
+				<div class="h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
+					<div
+						class="h-full rounded-full transition-all duration-500 {job().status === 'failed'
+							? 'bg-red-500'
+							: job().status === 'running'
+								? 'bg-blue-500'
+								: 'bg-green-500'}"
+						style="width: {progressPct()}%"
+					></div>
+				</div>
+			</div>
+		{/if}
+
 		{#if job()?.current}
 			<div class="mt-1 font-mono text-xs text-gray-500 dark:text-gray-400">
 				当前：{job().current.email}（{job().current.domain ?? '—'}）
 			</div>
 		{/if}
 
-		{#if (job()?.lines ?? []).length > 0}
+		{#if (job()?.failureReasons && Object.keys(job().failureReasons).length > 0) || (job()?.summary?.failure_reasons ?? []).length > 0}
+			<div class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+				失败原因：
+				{#each Object.entries(job()?.failureReasons ?? {}) as [kind, row]}
+					<span class="mr-2 inline-block">
+						<span class="font-mono text-red-500">{kind}</span>×{(row as any).count}
+						{#if (row as any).example}<span class="text-gray-400">（{(row as any).example}）</span>{/if}
+					</span>
+				{/each}
+				{#each job()?.summary?.failure_reasons ?? [] as row (row.kind)}
+					<span class="mr-2 inline-block">
+						<span class="font-mono text-red-500">{row.kind}</span>×{row.count}
+					</span>
+				{/each}
+			</div>
+		{/if}
+
+		<div class="mt-3 flex flex-wrap items-center gap-1">
+			{#each [['', '全部'], ['info', 'info'], ['warn', 'warn'], ['error', 'error'], ['debug', 'debug']] as [value, label]}
+				<button
+					class="rounded px-2 py-0.5 text-[11px] ring-1 {logLevel === value
+						? 'bg-gray-900 text-white ring-gray-900 dark:bg-white dark:text-black dark:ring-white'
+						: 'ring-gray-200 text-gray-500 dark:ring-gray-700'}"
+					on:click={() => {
+						logLevel = value as any;
+						refreshLog();
+					}}>{label}</button
+				>
+			{/each}
+			<button
+				class="ml-auto rounded px-2 py-0.5 text-[11px] ring-1 ring-gray-200 disabled:opacity-50 dark:ring-gray-700"
+				on:click={exportLog}
+				disabled={exporting || !job()}>导出日志</button
+			>
+			<button
+				class="rounded px-2 py-0.5 text-[11px] ring-1 ring-gray-200 dark:ring-gray-700"
+				on:click={() => loadDomains(true)}>刷新域名</button
+			>
+		</div>
+
+		{#if visibleLines().length > 0}
 			<pre
-				class="mt-2 max-h-48 overflow-y-auto rounded-lg bg-gray-50 p-2 font-mono text-[11px] leading-4 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{(job().lines ?? [])
-					.slice(-80)
-					.map((line: any) => `${line.at?.slice(11, 19) ?? ''} ${line.text}`)
+				class="mt-1 max-h-48 overflow-y-auto rounded-lg bg-gray-50 p-2 font-mono text-[11px] leading-4 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{visibleLines()
+					.map((line: any) => `${line.at?.slice(11, 19) ?? ''} ${String(line.level ?? '').toUpperCase().padEnd(5)} ${line.text}`)
 					.join('\n')}</pre>
 		{/if}
 
-		{#if (job()?.summary?.mail_domains ?? []).length > 0}
-			<div class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-				域名战绩：
-				{#each job().summary.mail_domains as row (row.provider + row.domain)}
-					<span class="mr-2 inline-block font-mono">
-						{row.domain} <span class="text-green-600">+{row.ok_count}</span>
-						{#if row.bad_count}<span class="text-red-500">-{row.bad_count}</span>{/if}
+		{#if chartRows().length > 0}
+			<div class="mt-3">
+				<div class="mb-1 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+					<span>域名战绩（成功/失败）</span>
+					<span class="text-[11px]">共 {chartRows().length} 个域 · 数据 {domainsPayload?.source ?? 'job'}</span>
+				</div>
+				<div class="flex flex-col gap-1">
+					{#each chartRows() as row (row.provider + row.domain)}
+						<div class="flex items-center gap-2 text-[11px]">
+							<span class="w-40 truncate font-mono text-gray-600 dark:text-gray-300" title={row.domain}>
+								{row.domain}
+							</span>
+							<svg class="h-3 flex-1" viewBox="0 0 100 10" preserveAspectRatio="none">
+								<rect x="0" y="0" width="100" height="10" fill="currentColor" class="text-gray-100 dark:text-gray-800" />
+								<rect
+									x="0"
+									y="0"
+									height="10"
+									fill="#22c55e"
+									width={(row.ok / chartMax()) * 100}
+								/>
+								<rect
+									x={(row.ok / chartMax()) * 100}
+									y="0"
+									height="10"
+									fill="#ef4444"
+									width={(row.bad / chartMax()) * 100}
+								/>
+							</svg>
+							<span class="w-16 text-right">
+								<span class="text-green-600">{row.ok}</span>
+								{#if row.bad}<span class="text-red-500"> / {row.bad}</span>{/if}
+							</span>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/if}
+	</div>
+
+	<!-- poe pool -->
+	<div class="rounded-xl border border-gray-100 p-4 dark:border-gray-800">
+		<div class="mb-1 flex items-center gap-2">
+			<span class="font-medium">Poe 号池（独立）</span>
+			<span class="text-[11px] text-gray-400">
+				凭据是 p-b cookie，和上面的 DeepAI api_key 池完全隔离
+			</span>
+		</div>
+		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+			Poe 的注册流程：邮箱验证码 → <span class="font-mono">Verify</span> → 要求手机号。
+			<b>没有短信供应商时账号会停在</b> <span class="font-mono">email_verified</span> /
+			<span class="font-mono">phone_required</span>，这是 Poe 的规则：它只给"最近验证过手机号"的会话建号。
+		</div>
+
+		<div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">数量</span>
+				<input
+					type="number"
+					min="1"
+					max="50"
+					bind:value={poeCount}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				/>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">引擎</span>
+				<select
+					bind:value={poeEngine}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				>
+					<option value="protocol">protocol（页内 GraphQL）</option>
+					<option value="browser">browser（Camoufox 表单）</option>
+					<option value="auto">auto</option>
+				</select>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">邮箱来源</span>
+				<select
+					bind:value={poeMail}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				>
+					<option value="tempmail_lol">tempmail.lol</option>
+					<option value="mailtm">mail.tm</option>
+					<option value="imap">自有域名 catch-all</option>
+					<option value="fixed">固定地址 +tag</option>
+				</select>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-gray-500 dark:text-gray-400">短信</span>
+				<select
+					bind:value={poeSms}
+					class="w-full rounded-lg bg-transparent px-2 py-1.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-gray-700"
+				>
+					<option value="off">off（停在手机号门槛）</option>
+					<option value="manual">manual（手动输码）</option>
+					<option value="sms_activate">sms-activate</option>
+					<option value="smspool">smspool</option>
+				</select>
+			</label>
+		</div>
+
+		<div class="mt-3 flex flex-wrap items-center gap-2">
+			<button
+				class="rounded-lg bg-black px-3 py-1.5 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-black"
+				on:click={startPoe}
+				disabled={busy === 'poe-start' || poe?.running}
+			>
+				开始 Poe 注册
+			</button>
+			{#if poe?.running}
+				<button
+					class="rounded-lg px-3 py-1.5 text-sm text-red-500 ring-1 ring-red-200 disabled:opacity-50 dark:ring-red-900"
+					on:click={stopPoe}
+					disabled={busy === 'poe-stop'}>停止</button
+				>
+			{/if}
+			<button class="rounded-lg px-3 py-1.5 text-sm ring-1 ring-gray-200 dark:ring-gray-700" on:click={loadPoe}>
+				刷新
+			</button>
+			<button
+				class="rounded-lg px-3 py-1.5 text-sm ring-1 ring-gray-200 disabled:opacity-50 dark:ring-gray-700"
+				on:click={exportPoeLog}
+				disabled={!poeJob()}>导出日志</button
+			>
+			<span class="text-xs text-gray-500 dark:text-gray-400">
+				验证 {poeCounts.email_verified ?? 0} · 待手机 {poeCounts.phone_required ?? 0} · 可用
+				{poeCounts.active ?? 0} · 失效 {poeCounts.dead ?? 0}
+			</span>
+		</div>
+
+		{#if poeJob()}
+			<div class="mt-3">
+				<div class="mb-1 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+					<span>进度 {poeJob().created ?? 0}/{poeJob().requested ?? 0}（{poePct()}%）· {poeJob().status}</span>
+					<span>
+						{#if poe?.running && poeJob()?.progress?.etaSeconds !== null}
+							预计剩余 {formatDuration(poeJob().progress?.etaSeconds)}
+						{:else}
+							用时 {formatDuration(poeJob().progress?.elapsedSeconds)}
+						{/if}
 					</span>
-				{/each}
+				</div>
+				<div class="h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
+					<div
+						class="h-full rounded-full {poeJob().status === 'running' ? 'bg-purple-500' : 'bg-green-500'}"
+						style="width: {poePct()}%"
+					></div>
+				</div>
+			</div>
+			{#if (poeJob()?.lines ?? []).length > 0}
+				<pre
+					class="mt-2 max-h-40 overflow-y-auto rounded-lg bg-gray-50 p-2 font-mono text-[11px] leading-4 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{(poeJob().lines ?? [])
+						.slice(-60)
+						.map((line: any) => `${line.at?.slice(11, 19) ?? ''} ${line.text}`)
+						.join('\n')}</pre>
+			{/if}
+		{/if}
+
+		{#if poeAccounts.length > 0}
+			<div class="mt-3 max-h-64 overflow-y-auto">
+				<table class="w-full text-xs">
+					<thead class="sticky top-0 bg-white text-gray-500 dark:bg-gray-900 dark:text-gray-400">
+						<tr>
+							<th class="py-1 text-left font-normal">邮箱</th>
+							<th class="py-1 text-left font-normal">状态</th>
+							<th class="py-1 text-left font-normal">引擎</th>
+							<th class="py-1 text-left font-normal">Cookie</th>
+							<th></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each poeAccounts as account (account.id)}
+							<tr class="border-t border-gray-100 dark:border-gray-800">
+								<td class="py-1.5 font-mono">{account.email}</td>
+								<td class="py-1.5">
+									<span
+										class={account.status === 'active'
+											? 'text-green-600'
+											: account.status === 'dead'
+												? 'text-red-500'
+												: 'text-amber-600'}>{account.status}</span
+									>
+								</td>
+								<td class="py-1.5">{account.engine || '—'}</td>
+								<td class="py-1.5">{(account.cookieNames ?? []).length} 个</td>
+								<td class="py-1.5 text-right">
+									{#if account.status !== 'active'}
+										<button
+											class="mr-2 text-green-600 disabled:opacity-50"
+											on:click={() => markPoe(account, 'active')}
+											disabled={busy === 'poe-' + account.id}>标记可用</button
+										>
+									{/if}
+									<button
+										class="text-red-500 disabled:opacity-50"
+										on:click={() => removePoe(account)}
+										disabled={busy === 'poe-' + account.id}>移除</button
+									>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
 			</div>
 		{/if}
 	</div>
 
 	<!-- api keys -->
 	<div class="rounded-xl border border-gray-100 p-4 dark:border-gray-800">
-		<div class="mb-1 font-medium">API Keys</div>		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+		<div class="mb-1 font-medium">API Keys</div>
+		<div class="mb-3 text-xs text-gray-500 dark:text-gray-400">
 			给 Open WebUI 和其它 OpenAI 兼容工具用。完整 Key 只在创建时显示一次（网关只存 SHA-256）。
 		</div>
 

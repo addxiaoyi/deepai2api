@@ -1,0 +1,6 @@
+# 协议腿只需要 httpx；浏览器腿按需装（camoufox 会带 1.3GB 内核）
+httpx>=0.27
+# 指纹浏览器（三选一即可，`doctor` 会告诉你哪个可用）
+# camoufox[geoip]>=0.4.11
+# patchright>=1.48
+# playwright>=1.48

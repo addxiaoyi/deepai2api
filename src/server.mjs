@@ -18,6 +18,8 @@ import { AllmodelsPool, importAccount, maskAccount } from "./allmodels-pool.mjs"
 import { AllmodelsRegistrations } from "./allmodels-register.mjs";
 import { ToolError, createToolRegistry } from "./allmodels-tools.mjs";
 import { PoePool } from "./poe-pool.mjs";
+import { createProviderRuntime } from "./providers.mjs";
+import { createProviderAdmin } from "./provider-admin.mjs";
 import { publicAccount } from "./store.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024;
@@ -174,11 +176,31 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     onAccount: () => {},
   });
 
+  /**
+   * Provider 运行时（wavespeed / novita / moonai …）：
+   * 每个 provider 一份号池 + 一份注册控制器 + 共用反代层。
+   * 路由命名空间独立：`/p/<provider>/v1/*` 与 `/api/admin/providers/*`，
+   * 与上面的 DeepAI `/v1/*`、`/api/admin/allmodels/*`、`/api/poe/*` 完全不重叠。
+   * 环境变量 `DCG_PROVIDERS` 可限定只装哪几个（逗号分隔）。
+   */
+  const providerRuntime = createProviderRuntime({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    store,
+    config,
+    enabled: String(process.env.DCG_PROVIDERS ?? "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean),
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+  const providerAdmin = createProviderAdmin({ runtime: providerRuntime, store, log });
+
   const bump = (model) => {
     stats.requests++;
     stats.byModel.set(model, (stats.byModel.get(model) ?? 0) + 1);
   };
-
   /* ---------------------------------------------------------------- sessions */
 
   const sessionOf = (req) => {
@@ -1151,13 +1173,26 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
           healthy: allmodelsPool.healthy().length,
           keys: allmodelsPool.accounts.filter((a) => a.gatewayKey).length,
         },
+        providers: providerRuntime.stats(),
         requests: stats.requests,
         streams: stats.streams,
         uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
       });
     }
 
-    if (path.startsWith("/api/admin/") || path.startsWith("/api/poe/")) return handleAdmin(req, res, path);
+    if (path.startsWith("/api/admin/") || path.startsWith("/api/poe/")) {
+      // Provider 管理面：独立前缀，先于 allmodels / poe 的分支处理
+      if (path === "/api/admin/providers" || path.startsWith("/api/admin/providers/")) {
+        return providerAdmin.handle(req, res, path, url);
+      }
+      return handleAdmin(req, res, path);
+    }
+
+    // Provider 反代面：`/p/<provider>/v1/*`（自带网关 Key 鉴权，见 provider-relay）
+    if (path.startsWith("/p/")) {
+      const handled = await providerRuntime.relay.handle(req, res, url, { auth: authorizeApi(req, url) });
+      if (handled) return;
+    }
 
     // ---- authenticated surfaces ----
     const auth = authorizeApi(req, url);
@@ -1261,7 +1296,7 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       });
   });
 
-  return { server, adminToken, allmodels, allmodelsPool };
+  return { server, adminToken, allmodels, allmodelsPool, providers: providerRuntime };
 }
 
 /**
