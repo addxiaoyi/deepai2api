@@ -21,7 +21,7 @@ OAuth 登录订阅账号 → 铸造 OpenAI 兼容 API Key → 给任意工具用
 
 ## 0. 闭环总览（先读这个）
 
-仓库现在有 **六条上游线**，它们共用同一个五环闭环：
+仓库现在有 **十四条线**，它们共用同一个五环闭环（ProxyScrape 是唯一产物为"出口"的一条）：
 
 ```
 ① 注册 ──▶ ② 入池 ──▶ ③ 出 Key ──▶ ④ 反代 ──▶ ⑤ 观测/回收
@@ -36,6 +36,16 @@ worker        <line>-pool.json    sk-dcg-…      /<line>/v1/*    /health · sta
 | Provider 运行时（wavespeed/novita/moonai/zo/blackbox） | `dcg.pool/<id>@1` | `tools/<id>-reg` | `/p/<id>/v1/*` | [PROVIDERS](docs/PROVIDERS.md) · [ZO](docs/ZO-POOL.md) |
 | Clever AI Hub | `dcg.pool/cleverai@1` | `tools/cleverai-reg` | `/cleverai/v1/*` | [CLEVERAI-POOL](docs/CLEVERAI-POOL.md) |
 | Gab AI | `dcg.pool/gabai@1` | `tools/gabai-reg` | `/gab/v1/*` | [GABAI-POOL](docs/GABAI-POOL.md) |
+| JEV AI | `dcg.pool/jevai@1` | `tools/jevai-reg` | `/jevai/v1/*` | [JEVAI-POOL](docs/JEVAI-POOL.md) |
+| Agnes AI | `dcg.pool/agnes@1` | `tools/agnes-reg` | `/agnes/v1/*` | [AGNES-POOL](docs/AGNES-POOL.md) |
+| Cerebras | `dcg.pool/cerebras@1` | `tools/cerebras-reg` | `/cerebras/v1/*` | [CEREBRAS-POOL](docs/CEREBRAS-POOL.md) |
+| OpenCode Zen | `dcg.pool/opencode-zen@1` | `tools/opencode-zen-reg` | `/opencode-zen/v1/*` | [OPENCODE-ZEN-POOL](docs/OPENCODE-ZEN-POOL.md) |
+| Requesty | `dcg.pool/requesty@1` | `tools/requesty-reg` | `/requesty/v1/*` | [REQUESTY-POOL](docs/REQUESTY-POOL.md) |
+| UnoRouter | `dcg.pool/unorouter@1` | `tools/unorouter-reg` | `/unorouter/v1/*` | [UNOROUTER-POOL](docs/UNOROUTER-POOL.md) |
+| Pollinations（匿名） | `dcg.pool/pollinations@1` | `tools/pollinations-reg` | `/pollinations/v1/*` | [POLLINATIONS-POOL](docs/POLLINATIONS-POOL.md) |
+| Gitee AI（文生图） | `dcg.pool/giteeai@1` | `tools/giteeai-reg` | `/giteeai/v1/*` | [GITEEAI-POOL](docs/GITEEAI-POOL.md) |
+| AMD 开发者云（GPU） | `dcg.pool/amd@1` | `tools/amd-reg` | 无（GPU 实例） | [AMD-POOL](docs/AMD-POOL.md) |
+| ProxyScrape（产物是**代理**） | `dcg.pool/proxyscrape@1` | `tools/proxyscrape-reg` | 无（分发给其它线） | [PROXYSCRAPE-POOL](docs/PROXYSCRAPE-POOL.md) |
 
 一条命令查闭环有没有断：
 
@@ -395,7 +405,11 @@ curl -fsSL …/install.sh | sudo bash -s -- --with-docker --with-camoufox
 一键验收（部署完先跑这个）：
 
 ```bash
-npm run loop            # 六条线闭环有没有断
+npm run loop            # 全部线闭环有没有断
+npm run verify          # 打真 HTTP：models / 注册 / 发 Key 还活着没有
+npm run amd             # AMD GPU 线：cookie 入池 / 积分 / 起停实例
+npm run pending         # 还差哪些外部条件（缺什么变量、怎么补）
+npm run pending:check   # 按当前环境判断哪些已就绪
 curl -s localhost:8787/health | jq '.cleverai, .gabai'
 npm run test:all        # 静态 + 接口 + 197 项 worker 测试 + 既有回归
 ```
@@ -861,6 +875,233 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8787/api/admin/gabai/pool/expor
 
 ---
 
+## 3.65 JEV AI（jev-ai.org）
+
+Next.js + **Better Auth** 的站点，产物是 `sk-glm5-…` Key（模型 API 在独立基址
+`https://jev-ai.org/api/v1`）。注册机在 `tools/jevai-reg`，号池 `dcg.pool/jevai@1`。
+
+```powershell
+node src/jevai-cli.mjs register -n 5 --mail-provider imap --mail-domain example.com
+node src/jevai-cli.mjs keys        # 一行一把 sk-glm5-…
+node src/jevai-cli.mjs apply       # 写 data/keys/jevai.{txt,json}（其它工具直接接入）
+```
+
+三件事值得记住：
+
+1. **一次性邮箱会被拒**：`EMAIL_DOMAIN_NOT_ALLOWED`，必须自有域名 catch-all + IMAP。
+2. **建 Key 的端点不在首屏 bundle 里**（`/settings/apikeys` 是客户端渲染），所以 worker
+   用候选探测 + 命中缓存（`data/key-endpoints.json`）：谁的响应里出现 `sk-glm5-…` 就用谁。
+3. **反代面 `/jevai/v1/*`** 只换 `Authorization` 并做轮询/冷却/故障切换；401/403/429/5xx
+   才怪 Key，400/404 不怪（上游没开的端点会翻成 `upstream_endpoint_missing`，不让下游误判鉴权）。
+
+自动接入：任务结束写 `data/keys/jevai.txt`（一行一把）与 `data/keys/jevai.json`
+（`{"provider":"jevai","openai_base":…,"keys":[…]}`），Open WebUI 里接
+`http://<网关>:8787/jevai/v1` + `sk-dcg-…` 即可。细节见
+[`docs/JEVAI-POOL.md`](docs/JEVAI-POOL.md)。
+
+---
+
+## 3.7 ProxyScrape 代理池（唯一产物是"出口"的一条线）
+
+前面七条线产出 Key，这条线产出**代理**：注册 proxyscrape.com → 领 premium 免费试用 →
+试用给出 `host:port:user:pass` → 写进代理池 → **自动分发给其它注册机当出口**。
+
+```
+注册(tools/proxyscrape-reg) ──▶ /api/admin/proxyscrape/pool/import ──▶ proxyscrape-pool.json
+                                              │                              │
+                                              └ applyProxies() ──▶ data/proxies/<line>.txt
+                                                                             │
+其它注册机启动时（没显式给 --proxy）◀────────────────────────────────────────┘
+```
+
+| 维度 | 说明 |
+| --- | --- |
+| 上游 | `dashboard.proxyscrape.com`（`/v2/v4/...`，Next.js SPA） |
+| 人机校验 | **Cloudflare Turnstile**，sitekey `0x4AAAAAAAFWUVCKyusT9T8r`，字段 `cf_turnstile_token` |
+| 试用 | 按账号领：`trial-eligibility` → `claim-trial`；重复领 400 |
+| 凭据解析 | `accounts-summary.services.<product>.proxy_credentials` 字段名不统一 → **深扫描** + `proxy-setup` 文本双路兜底 |
+| 产物 | `proxies[]`（去重）+ `data/proxies/<line>.txt`（按线分片） |
+
+```powershell
+# 注册 3 个并领试用（串行：试用按出口发）
+node src/proxyscrape-cli.mjs register -n 3 --mail-provider imap --mail-domain example.com
+
+# 看代理 / 只给某条线分发 / 看每条线分到几条
+node src/proxyscrape-cli.mjs proxies
+node src/proxyscrape-cli.mjs apply --line cleverai
+node src/proxyscrape-cli.mjs share
+```
+
+**自动配置的接法**（已接进 cleverai / gabai，其余线一行即可）：
+
+```js
+const shared = withSharedProxies({ dataDir, line: "poe", proxies: body.proxies });
+registrations.start({ ...body, proxies: shared.proxies });   // 响应回 proxiesSource
+```
+
+文件语义：该线**有**自己的分片文件就用它（哪怕空文件），**没有**才退回 `shared.txt` ——
+所以"分发过但这条线分到 0 条"不会被别的线代理污染。分片是轮转的，避免多条线同时压
+同一条出口。
+
+### 导出给其他设备
+
+手机 / 路由器 / 另一台电脑要的形状不一样，所以除了文件导出还有**订阅链接**：
+
+```powershell
+# 一次性导出（sub2api / cpa / clash / singbox / surge / url / raw / at / json / csv / env）
+node src/proxyscrape-cli.mjs export-format --format clash --alive --out out/clash.yaml
+
+# 订阅链接：设备端定时回拉，不需要管理口令
+node src/proxyscrape-cli.mjs subscription add --name phone --format clash
+#   -> http://<网关>/proxy/64oItZI1mEqR…
+node src/proxyscrape-cli.mjs subscription revoke 64oItZI1mEqR…
+```
+
+- `GET /proxy/<token>` 是公开面，**只能读代理**（读不到账号/Key/管理数据），可撤销；
+  同名再次添加会复用原令牌，换格式只需 `?format=singbox`。
+- 响应带 `Profile-Update-Interval: 6` 与 `X-Proxy-Count`，Clash / sing-box 会按它回拉。
+- `?alive=1` 先做 TCP 探测，只导出连得上的；探测结果同时写回代理池健康计数。
+- 面板「ProxyScrape 代理池」卡片里也有：格式下拉 / 预览 / 下载 / 探测存活 /
+  生成订阅链接（带复制与撤销）。
+
+细节（字段、接口表、失败分类）见 [`docs/PROXYSCRAPE-POOL.md`](docs/PROXYSCRAPE-POOL.md)，
+worker 用法见 [`tools/proxyscrape-reg/README.md`](tools/proxyscrape-reg/README.md)。
+
+---
+
+## 3.95 六条 OpenAI 兼容线（agnes / cerebras / opencode-zen / requesty / unorouter / pollinations）
+
+调研里排前五的免费线 + 一条匿名兜底线，已经全部接进来了。它们共用**一份实现**
+（`src/openai-lines.mjs`）：注册控制器、号池、反代都只有一份代码，每条线只是一段
+`defineLine({...})` 描述 + 一层薄壳文件。
+
+| 线 | 上游 | Key 前缀 | 免费额度 | 反代 |
+| --- | --- | --- | --- | --- |
+| Agnes AI | `api.agnes-ai.cn/v1` | `sk-` | 无限期免费、不限 token、~20 RPM | `/agnes/v1/*` |
+| Cerebras | `api.cerebras.ai/v1` | `csk-` | 30 RPM / 14,400 RPD / 60k TPM | `/cerebras/v1/*` |
+| OpenCode Zen | `opencode.ai/zen/v1` | `sk-` | 30 RPM / 500 RPD（`-free` 模型不限） | `/opencode-zen/v1/*` |
+| Requesty | `router.requesty.ai/v1` | `sk-` | 200 RPD | `/requesty/v1/*` |
+| UnoRouter | `api.unorouter.com/v1` | `sk-` | 190+ `:free`，单模型 1 RPM | `/unorouter/v1/*`（也支持 `/v1/messages`） |
+| Pollinations | `gen.pollinations.ai/v1` | —（匿名） | 10 RPM / 500 RPD，免注册 | `/pollinations/v1/*` |
+
+```powershell
+node src/agnes-cli.mjs register -n 5 --mail-domain example.com   # 也可以换 cerebras / requesty ...
+node src/agnes-cli.mjs keys
+node src/agnes-cli.mjs apply        # 写 data/keys/agnes.{txt,json}
+```
+
+后端只有一条代码路径：`/api/admin/<line>/{status,register,register/stop,pool,pool/import,pool/export,keys,apply,connect}`
+外加 `GET /api/admin/lines` 总览。匿名线（Pollinations）不需要上游 Key，
+号池里存的是"匿名出口"，反代直接透传。
+
+**worker 侧**：`tools/linekit` 是共用实现（Better Auth 注册、发 Key 端点探测、号池落库、
+失败分类），每个 `tools/<line>-reg/<line>_reg/site.py` 只写站点事实。
+
+> 端点可信度：注册/发 Key 路径来自公开文档与社区清单，**第一次跑先 `python -m <line>_reg doctor`**；
+> 路径不对只改 `site.py`，逻辑不用动。
+
+**UI**：设置页底部的 `<LinePools />` 左栏就是号池列表（14 条线），点一条右边切到该线的
+独立页面（注册表单 / 号池表 / Key / 导出与接入 / 运行日志）。想进主侧边栏见
+[`patches/SIDEBAR-POOLS.md`](patches/SIDEBAR-POOLS.md)。
+
+---
+
+## 3.9 下一个该做哪条线（免费渠道登记表）
+
+现有 8 条线之外，还有一批"免费额度够大、OpenAI 兼容、能靠注册机拿"的站。这部分不是代码
+而是**决策数据**：`src/line-candidates.mjs`（29 条候选）+ `src/lines-cli.mjs`。
+
+```powershell
+node src/lines-cli.mjs list                 # 按分数排（score = 0.4*自动化 + 0.35*反代 + 0.25*额度 - 热度惩罚）
+node src/lines-cli.mjs list --only email     # 只要邮箱就能跑的
+node src/lines-cli.mjs show agnes            # 额度/门槛/反代契合的完整事实
+node src/lines-cli.mjs plan agnes            # 生成"新增这条线"的文件清单 + 7 步 checklist
+node src/lines-cli.mjs probe cerebras        # 打上游 /models，看 401（正常）还是 404（base 错）
+```
+
+结论（详见 [`docs/FREE-LINES-SURVEY.md`](docs/FREE-LINES-SURVEY.md)）：
+
+| 优先级 | 线 | 为什么 |
+| --- | --- | --- |
+| ① | Agnes AI | 无限期免费、不限 token、20 RPM、OpenAI 全兼容，**纯邮箱注册** |
+| ② | Cerebras | 30 RPM / 14,400 RPD，反代最稳，竞争小于 Groq |
+| ③ | OpenCode Zen | 500 RPD，`-free` 模型不限额度，模型新 |
+| ④ | Requesty | 200 RPD，聚合网关自带上游兜底 |
+| ⑤ | UnoRouter | 190+ `:free` 模型，靠模型轮换摊 1 RPM |
+| 兜底 | Pollinations | **不用注册**，IP 限速直连，号池空了也能跑 |
+
+明确不做的：Kluster（绑卡）、蚂蚁百灵（绑支付宝实名）、Runcrate / GitHub Models（GitHub 号需满 30 天）、
+Cloudflare（自家协议 + 1 万 token/天）、Synap（全网共享额度，多号不加量）。
+
+判断规则也写在两处：**纯 OpenAI 兼容的聚合站优先加进 `providers` 线**（半天，不用新 worker）；
+**有自己的注册/发 Key/会话体系的才新建独立线**（1-2 天，参考 `jevai`）。
+
+---
+
+## 3.99 真实可用性巡检（`npm run verify`）
+
+注册机要不要信，取决于端点还活着没有。所以有一条**打真 HTTP** 的巡检：
+
+```powershell
+npm run verify                 # 每条线：models / 注册(发码) / 发 Key，逐条给判定
+npm run verify:write           # 顺手把结果写进 docs/LINES-STATUS.md
+```
+
+判定口径（避免"200 就算能用"）：
+
+| 检查 | 判定 |
+| --- | --- |
+| `models` | 200=匿名可列；401/403=活着但需 Key（**正常**）；回 HTML=路径错；连不上=📡 |
+| 注册 / 发码 | **404 或回 HTML = 端点不存在**；4xx+JSON=存在 |
+| 发 Key | 401/400/405=存在（要登录/要参数）；404=路径不对 |
+| 验证码 | 响应里出现 captcha/turnstile/ticket/randstr → 🔐 有门槛 |
+
+当前实测（完整表格见 [`docs/LINES-STATUS.md`](docs/LINES-STATUS.md)）：
+
+| 线 | 结论 |
+| --- | --- |
+| Cerebras | ✅ usable（models 403、`/api/auth/api-keys` 400 都在） |
+| Agnes AI | 🔐 usable-with-captcha（三个端点全在，发码要腾讯云 ticket+randstr） |
+| OpenCode Zen / Pollinations / Gitee AI / Gab AI | 🟡 models 匿名 200；发 Key 需登录态，路径未见公开 |
+| Requesty / JEV AI | 🟡 注册端点确定存在，发 Key 端点仍是未知（要登录后抓） |
+| Clever AI | ❌ models 直接 404：它要走 `appserver` + AppCheck，已单独有文档 |
+| ProxyScrape | 🔐 注册端点存在（400=缺 Turnstile token） |
+
+`verify` 只打**不需要登录**的端点，所以"发 Key 端点 unknown"不等于不能用 ——
+而是"要登录后才看得到，脚本无法凭空确认"。凡是我实测过的结论都写在
+[`docs/LINES-STATUS.md`](docs/LINES-STATUS.md) 里，带状态码和响应片段。
+
+---
+
+## 3.995 待配置项（`npm run pending`）
+
+有些事代码解决不了，只差外部条件。全部集中成一张可查询的表（不是散在各文档里）：
+
+```powershell
+npm run pending                 # 14 项：每条线还缺什么
+npm run pending --  --line agnes
+npm run pending:check           # 按当前环境变量算：哪些已就绪、哪些还缺
+npm run pending:write           # 生成 docs/PENDING-CONFIG.md（带实测证据）
+```
+
+三种状态：
+
+| 状态 | 含义 | 处理方式 |
+| --- | --- | --- |
+| `open` | 只缺配置，填环境变量就能跑 | 按 `how` 里的命令填 |
+| `blocked` | 需要**登录态抓一次**端点（无法凭空发现） | 抓一次填进对应 `site.py`，之后自动化 |
+| `solved` | 代码已实现，运行时按需取票据 | 直接用 |
+
+当前 14 项（详见 [`docs/PENDING-CONFIG.md`](docs/PENDING-CONFIG.md)）：2 项已解决（Agnes 腾讯验证码链路、UnoRouter 建 Key 端点），
+4 项等登录态（Cerebras / OpenCode Zen / Requesty / JEV 的建 Key 语义），8 项等配置
+（域名邮箱、App Check token、Gitee 令牌、Turnstile 求解器、出口代理、公网地址、管理口令、ProxyScrape）。
+
+**每个 `blocked` 项替代方案**：那些线仍然可跑，只要手工建一次 Key，然后
+`POST /api/admin/<line>/pool/import` 入池 —— 号池、反代、导出、面板全部照常工作。
+也就是说：**没有一项会让整条线不可用**，只是自动化程度不同。
+
+---
+
 ## 4. OpenWebUI 二次开发（fork）
 
 `vendor/open-webui` = **Open WebUI 0.13.4 上游 + DeepAI provider**。
@@ -949,6 +1190,8 @@ tools/poe-reg/     Poe 注册机（页内 GraphQL + Camoufox，独立 cookie 号
 tools/moonai-reg/  MoonAI 注册机（表单 + 邮箱验证 + OAuth，协议/指纹浏览器双引擎）
 tools/cleverai-reg/ Clever AI Hub 注册机（Firebase + App Check，协议/指纹浏览器双引擎）
 tools/gabai-reg/   Gab AI 注册机（gab.ai 表单 + 建 key）
+tools/proxyscrape-reg/ 试用注册机（Turnstile + 代理解析，产物是代理）
+tools/jevai-reg/   JEV 注册机（Better Auth + Key 端点探测，产物是 sk-glm5-…）
 tools/blackbox-reg/ Blackbox AI 注册机（Google OAuth：会话/授权码协议腿 + 指纹浏览器腿）
 src/providers.mjs        provider 运行时装配（每个 provider 一份池 + 控制器）
 src/provider-admin.mjs   `/api/admin/providers/*` 管理面
@@ -958,17 +1201,34 @@ src/cleverai-pool.mjs    Clever AI 号池：落盘格式、去重、钱包、冷
 src/cleverai-register.mjs 批量注册控制器（起 python worker、流式事件、入池）
 src/cleverai-relay.mjs   omni 信封 + SSE ⇄ OpenAI（含 tools / tool_calls 双向翻译、App Check 续期）
 src/cleverai-cli.mjs     Clever AI 命令行（register / pool / export / import / keys / chat）
+src/proxyscrape-pool.mjs     代理池：账号 + 代理去重 / 轮询 / 冷却 / 分片 / 导出
+src/proxyscrape-register.mjs 代理池注册控制器（任务结束自动分发）
+src/proxy-share.mjs         出口分发：写 data/proxies/<line>.txt，其它注册机自动吃
+src/proxyscrape-cli.mjs      命令行（register / proxies / apply / share / export）
+src/jevai-pool.mjs           JEV 号池：账号 + sk-glm5-… + 网关 Key + 导出接入描述
+src/jevai-register.mjs       注册控制器（任务结束自动写 data/keys/jevai.*）
+src/jevai-relay.mjs          /jevai/v1 反代：换 Key + 冷却 + 故障切换
+src/jevai-cli.mjs            命令行（register / keys / apply / import / test-key）
+src/line-candidates.mjs      候选线登记表 + 评分（下方"下一条线做什么"的数据源）
+src/lines-cli.mjs            list / show / plan / probe / markdown
 src/gabai-pool.mjs       Gab AI 号池：落盘格式、去重、plusBlocked、冷却、导出
 src/gabai-register.mjs   Gab AI 批量注册控制器
 src/gabai-proxy.mjs      Gab AI 直通反代 + mintApiKey（网页反代出 apikey）
 deploy/           Linux 一键部署：install.sh + deepai-gateway.service + deepai-webui.service
-docs/LOOP.md           闭环总览：五环定义、六条线矩阵、缺口决策、新增线 checklist
+docs/LOOP.md           闭环总览：五环定义、七条线矩阵、缺口决策、新增线 checklist
 docs/ALLMODELS-POOL.md 号池协议（schema / 写入口径 / 接口）
 docs/MOONAI-POOL.md     MoonAI 号池协议 + 注册取证表 + 反代行为
 docs/CLEVERAI-POOL.md   Clever AI 号池协议 + App Check 取证 + 反代/工具翻译
 docs/GABAI-POOL.md      Gab AI 号池协议 + 反代直通 + mint key
 docs/POE-POOL.md        Poe 号池协议（为什么没有反代面）
 docs/ZO-POOL.md         Zo 号池协议 + 魔法链注册 + /zo/ask 翻译
+docs/PROXYSCRAPE-POOL.md 代理池协议 + 出口分发（自动给其它注册机配 proxy）
+docs/JEVAI-POOL.md    JEV AI 号池协议 + Key 端点探测 + /jevai/v1 反代 + 自动接入
+docs/FREE-LINES-SURVEY.md 免费模型渠道调研：29 条候选的评分 / 门槛 / 接入顺序
+docs/CAPTCHA-SOLVER.md 本地 Turnstile 求解器（tools/captcha-solver）的协议与接入
+docs/LINES-STATUS.md  各线真实可用性（npm run verify:write 生成，带状态码与响应片段）
+docs/PENDING-CONFIG.md 待配置项清单（npm run pending:write 生成：缺什么变量、怎么补、实测证据）
+docs/VENDOR.md         vendored 第三方代码的出处与许可（captcha-solver / giteeai2api）
 scripts/check-loop.mjs  闭环自检（npm run loop）
 docs/DEPLOY.md         部署手册（三种形态 / 环境变量矩阵 / Nginx / 备份回滚 / 排障）
 docs/BLACKBOX-POOL.md   Blackbox 号池协议 + Auth.js/Google OAuth 取证 + 防封与反代
@@ -985,9 +1245,15 @@ scripts/apply-fork.ps1  一键还原 fork（克隆 + 打补丁 + 构建）
 
 ```
 npm run loop            6 条线   闭环自检：五环 + schema + 路由 + 文档 + 测试（有缺口 exit 1）
-npm run test:loop      35/35   cleverai 18 + cleverai-routes 10 + gabai 7
+npm run test:loop      122/122  号池/分发/导出/JEV/六线引擎/候选表/captcha 客户端
 npm run test:fork      12/12   WebUI 面板接线（Pools + MoonAI：路由/导出/挂载/块配对）
+npm run test:proxyscrape 40/40+15/15  代理池 + 分发 + 导出格式（含 sub2api/cpa）+ 订阅 + worker 离线
 npm run test:workers  197/197  10 个 Python worker 的离线协议/配置/号池测试
+npm run test:jevai     19/19+18/18  JEV 号池 + 路由（含签到）+ worker 离线（Better Auth / Key 探测 / 签到）
+npm run giteeai        Gitee AI 令牌池 CLI（import / verify / pool / keys / apply）
+npm run test:lines     7/7     候选线登记表完整性 + 评分/分档/plan 生成
+npm run test:openai-lines 15/15  六条线引擎（池/匿名/导出/网关 Key）+ 路由（总览/管理面/反代鉴权）
+npm run test:loop      122/122  上面全部 + captcha 客户端（本地 mock solver）
 npm run test:all       全绿    loop + test:loop + test:workers + e2e + providers（一条命令验完）
 node tests\e2e.mjs     28/28   管理台登录、伪造 state 拒绝、OAuth 交换、铸 Key、
                               转发、Anthropic（JSON+SSE）、billing、限额、

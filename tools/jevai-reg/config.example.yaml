@@ -1,0 +1,34 @@
+# jev-ai.org 注册机配置示例
+base_url: https://jev-ai.org
+count: 1
+concurrency: 1          # 一个出口同时只跑一个注册，最稳
+attempts: 3
+retry_rounds: 1
+delay: [20, 50]
+timeout: 45
+verify_email: true      # 走邮件里的验证链接（推荐：未验证的账号额度/权限可能受限）
+checkin: true           # 每天签到顺手加额度
+key_name: ""            # 建 Key 时的显示名，空则用 dcg-YYYY-MM-DD
+output_dir: out
+proxies: []             # 空则读 HTTPS_PROXY
+
+mail:
+  provider: imap        # imap | fixed | mailtm | tempmail_lol（jev 会拒一次性域名）
+  domain: example.com
+  domains: []
+  prefix: ""
+  imap_host: imap.example.com
+  imap_port: 993
+  imap_user: catchall@example.com
+  imap_password: ""
+  verify_timeout: 180
+
+antiban:
+  min_delay: 20
+  max_delay: 50
+  per_proxy_concurrency: 1
+  proxy_cooldown: 900
+  max_failures_per_proxy: 2
+
+push_url: ""            # 例如 http://127.0.0.1:8787
+push_token: ""          # 管理口令

@@ -8,6 +8,7 @@
 import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 
 import { chatToMessage, messagesToChat, streamAsAnthropic } from "./anthropic.mjs";
@@ -27,6 +28,40 @@ import { CleveraiRelay, resolveEngine as resolveCleveraiEngine } from "./clevera
 import { GabaiPool, importAccount as importGabaiAccount, maskAccount as maskGabaiAccount } from "./gabai-pool.mjs";
 import { GabaiRegistrations } from "./gabai-register.mjs";
 import { GAB_PATHS, GabaiProxy } from "./gabai-proxy.mjs";
+import {
+  ProxyscrapePool,
+  maskAccount as maskProxyscrapeAccount,
+  maskProxy as maskProxyscrapeProxy,
+} from "./proxyscrape-pool.mjs";
+import { ProxyscrapeRegistrations } from "./proxyscrape-register.mjs";
+import { applyProxies, proxyShareStatus, withSharedProxies } from "./proxy-share.mjs";
+import {
+  DEFAULT_FORMAT as DEFAULT_PROXY_FORMAT,
+  FORMATS as PROXY_FORMATS,
+  ShareStore as ProxyShareStore,
+  exportFileName as proxyExportFileName,
+  maskShare as maskProxyShare,
+  renderProxies,
+} from "./proxy-export.mjs";
+import { probeProxies } from "./proxy-check.mjs";
+import { solveTurnstile, solverStatus } from "./captcha.mjs";
+import {
+  JevaiPool,
+  importAccount as importJevaiAccount,
+  maskAccount as maskJevaiAccount,
+} from "./jevai-pool.mjs";
+import { JevaiRegistrations } from "./jevai-register.mjs";
+import { LINE as AMD_LINE, instanceSummary as amdInstanceSummary } from "./amd-pool.mjs";
+import { JevaiRelay, explainUpstreamError } from "./jevai-relay.mjs";
+import {
+  LinePool,
+  LineRegistrations,
+  LineRelay,
+  defineLine,
+  explainModelError,
+  importAccount as importLineAccount,
+  maskAccount as maskLineAccount,
+} from "./openai-lines.mjs";
 import { PoePool } from "./poe-pool.mjs";
 import { createProviderRuntime } from "./providers.mjs";
 import { createProviderAdmin } from "./provider-admin.mjs";
@@ -286,6 +321,224 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     log: (level, message) => log(level === "warn" ? "warn" : "info", message),
     upstreamBase: process.env.GABAI_UPSTREAM || "https://gab.ai",
   });
+
+  /**
+   * proxyscrape.com 号池：唯一一条**产物是代理**的线。
+   *
+   * 账号领 premium 试用 → 试用给出 `host:port:user:pass` → 写进 `proxies[]` →
+   * 任务结束自动 `applyProxies()` 分发成 `data/proxies/<line>.txt`，
+   * 其它注册机在没显式传 `--proxy` 时自动吃这些出口。
+   */
+  const proxyscrapePool = ProxyscrapePool.at(config.dataDir, {
+    baseUrl: process.env.PROXYSCRAPE_BASE_URL || "https://dashboard.proxyscrape.com",
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
+  const proxyscrape = new ProxyscrapeRegistrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    pool: proxyscrapePool,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account, proxies }) => {
+      log("info", `proxyscrape 入池 ${account.email}（+${proxies} 条代理，池内 ${proxyscrapePool.stats().proxies}）`);
+    },
+  });
+
+  /**
+   * jev-ai.org 号池：产物是 `sk-glm5-…` Key（基址 https://jev-ai.org/api/v1）。
+   * 任务结束自动写 `data/keys/jevai.{txt,json}`，其它工具直接接入；
+   * 网关自己则通过 `/jevai/v1/*` 把这批 Key 包成一个 OpenAI 兼容面。
+   */
+  const jevaiPool = JevaiPool.at(config.dataDir, {
+    baseUrl: process.env.JEVAIS_BASE_URL || "https://jev-ai.org",
+    apiBase: process.env.JEVAIS_API_BASE || "https://jev-ai.org/api/v1",
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+
+  const jevai = new JevaiRegistrations({
+    dataDir: config.dataDir,
+    port: config.port,
+    token: adminToken,
+    pool: jevaiPool,
+    store,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account, gatewayKey }) => {
+      log("info", `jevai 入池 ${account.email}（号池 ${jevaiPool.size}，网关 Key ${gatewayKey?.prefix ?? "-"}）`);
+    },
+  });
+
+  const jevaiRelay = new JevaiRelay({
+    pool: jevaiPool,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    upstreamBase: process.env.JEVAIS_UPSTREAM || "https://jev-ai.org",
+  });
+
+  /**
+   * 六条 OpenAI 兼容线（agnes / cerebras / opencode-zen / requesty / unorouter / pollinations）。
+   * 站点差异全在描述里，代码只有一份（src/openai-lines.mjs）。
+   */
+  const OPENAI_LINES = [
+    defineLine({
+      id: "agnes",
+      name: "Agnes AI",
+      baseUrl: "https://api.agnes-ai.cn",
+      apiBase: "https://api.agnes-ai.cn/v1",
+      keyPrefix: "sk-",
+      models: ["agnes-3.0-flash", "agnes-2.5-flash"],
+      envPrefix: "AGNES_",
+      note: "无限期免费、不限 token、约 20 RPM",
+    }),
+    defineLine({
+      id: "cerebras",
+      name: "Cerebras",
+      baseUrl: "https://cloud.cerebras.ai",
+      apiBase: "https://api.cerebras.ai/v1",
+      keyPrefix: "csk-",
+      models: ["llama-3.3-70b", "qwen-3-235b-a22b"],
+      envPrefix: "CEREBRAS_",
+    }),
+    defineLine({
+      id: "opencode-zen",
+      name: "OpenCode Zen",
+      baseUrl: "https://opencode.ai",
+      apiBase: "https://opencode.ai/zen/v1",
+      keyPrefix: "sk-",
+      freeSuffix: "-free",
+      models: ["mimo-v2.5-free", "nemotron-3-ultra-free"],
+      envPrefix: "OPENCODE_ZEN_",
+    }),
+    defineLine({
+      id: "requesty",
+      name: "Requesty",
+      baseUrl: "https://app.requesty.ai",
+      apiBase: "https://router.requesty.ai/v1",
+      keyPrefix: "sk-",
+      models: ["nvidia/nemotron-3-ultra", "gemma-4-31b"],
+      envPrefix: "REQUESTY_",
+    }),
+    defineLine({
+      id: "unorouter",
+      name: "UnoRouter",
+      baseUrl: "https://unorouter.com",
+      apiBase: "https://api.unorouter.com/v1",
+      keyPrefix: "sk-",
+      freeSuffix: ":free",
+      anthropic: true,
+      models: ["deepseek-v4-flash:free", "glm-5.2:free"],
+      envPrefix: "UNOROUTER_",
+    }),
+    defineLine({
+      id: "giteeai",
+      name: "Gitee AI",
+      baseUrl: "https://ai.gitee.com",
+      apiBase: process.env.GITEEAI_UPSTREAM || "https://ai.gitee.com/v1",
+      keyPrefix: "",
+      imagesOnly: true,
+      models: ["z-image-turbo", "Qwen-Image-Edit"],
+      envPrefix: "GITEEAI_",
+      note: "文生图（OpenAI Images 形状）；令牌来自 gitee.com，没有机器注册接口",
+    }),
+    defineLine({
+      id: "pollinations",
+      name: "Pollinations",
+      baseUrl: "https://gen.pollinations.ai",
+      apiBase: "https://gen.pollinations.ai/v1",
+      keyPrefix: "",
+      anonymous: true,
+      models: ["openai", "openai-large", "gemini"],
+      envPrefix: "POLLINATIONS_",
+    }),
+  ];
+
+  // 审计脚本按**字面量**核对这张表（scripts/check-loop.mjs），改动时保持同步。
+  const LINE_ROUTE_LITERALS = {
+    agnes: {
+      relay: "/agnes/v1/",
+      admin: ["/api/admin/agnes/status", "/api/admin/agnes/pool/import", "/api/admin/agnes/pool/export"],
+    },
+    cerebras: {
+      relay: "/cerebras/v1/",
+      admin: ["/api/admin/cerebras/status", "/api/admin/cerebras/pool/import", "/api/admin/cerebras/pool/export"],
+    },
+    "opencode-zen": {
+      relay: "/opencode-zen/v1/",
+      admin: [
+        "/api/admin/opencode-zen/status",
+        "/api/admin/opencode-zen/pool/import",
+        "/api/admin/opencode-zen/pool/export",
+      ],
+    },
+    requesty: {
+      relay: "/requesty/v1/",
+      admin: ["/api/admin/requesty/status", "/api/admin/requesty/pool/import", "/api/admin/requesty/pool/export"],
+    },
+    unorouter: {
+      relay: "/unorouter/v1/",
+      admin: ["/api/admin/unorouter/status", "/api/admin/unorouter/pool/import", "/api/admin/unorouter/pool/export"],
+    },
+    giteeai: {
+      relay: "/giteeai/v1/",
+      admin: ["/api/admin/giteeai/status", "/api/admin/giteeai/pool/import", "/api/admin/giteeai/pool/export"],
+    },
+    pollinations: {
+      relay: "/pollinations/v1/",
+      admin: [
+        "/api/admin/pollinations/status",
+        "/api/admin/pollinations/pool/import",
+        "/api/admin/pollinations/pool/export",
+      ],
+    },
+  };
+
+  const linePools = new Map();
+  const lineRegs = new Map();
+  const lineRelays = new Map();
+  for (const line of OPENAI_LINES) {
+    const pool = LinePool.at(line, config.dataDir, {
+      log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    });
+    linePools.set(line.id, pool);
+    lineRegs.set(
+      line.id,
+      new LineRegistrations({
+        line,
+        dataDir: config.dataDir,
+        pool,
+        store,
+        log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+        onAccount: ({ account, gatewayKey }) => {
+          log("info", `${line.id} 入池 ${account.email}（号池 ${pool.size}，网关 Key ${gatewayKey?.prefix ?? "-"}）`);
+        },
+      }),
+    );
+    lineRelays.set(line.id, new LineRelay({ line, pool, log: (level, message) => log(level === "warn" ? "warn" : "info", message) }));
+  }
+  const lineById = (id) => OPENAI_LINES.find((line) => line.id === id) ?? null;
+
+  /**
+   * AMD 开发者云（GPU）：产物是"能起 MI300X 实验实例的账号 cookie"。
+   * 它不是 OpenAI 兼容面（没有 /v1），所以只接管理面，不接反代。
+   */
+  const amdPool = LinePool.at(AMD_LINE, config.dataDir, {
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+  });
+  const amdRegistrations = new LineRegistrations({
+    line: AMD_LINE,
+    dataDir: config.dataDir,
+    pool: amdPool,
+    store,
+    log: (level, message) => log(level === "warn" ? "warn" : "info", message),
+    onAccount: ({ account }) => {
+      log("info", `amd 入池 ${account.email}（池内 ${amdPool.size}，积分 ${account.credits?.points ?? "?"}）`);
+    },
+  });
+
+  // 代理订阅：给手机/路由器这类"不方便填管理口令"的设备用的只读链接
+  const publicBase = String(config.publicBase ?? "").replace(/\/+$/, "");
+  const shareUrlFor = (token) => `${publicBase}/proxy/${token}`;
+  const proxyShares = new ProxyShareStore(config.dataDir);
+
 
 
 
@@ -943,6 +1196,84 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
             }
           : null,
       },
+      amd: {
+        pool: amdPool.stats(),
+        instances: amdInstanceSummary(amdPool),
+        running: amdRegistrations.job?.status === "running",
+        apiBase: AMD_LINE.apiBase,
+        job: amdRegistrations.job
+          ? {
+              id: amdRegistrations.job.id,
+              status: amdRegistrations.job.status,
+              created: amdRegistrations.job.created ?? 0,
+              failed: amdRegistrations.job.failed ?? 0,
+            }
+          : null,
+      },
+      lines: Object.fromEntries(
+        OPENAI_LINES.map((line) => {
+          const pool = linePools.get(line.id);
+          const registrations = lineRegs.get(line.id);
+          return [
+            line.id,
+            {
+              name: line.name,
+              apiBase: line.apiBase,
+              schema: line.schema,
+              relayPrefix: line.relayPrefix,
+              anonymous: line.anonymous === true,
+              pool: pool.stats(),
+              running: registrations.job?.status === "running",
+              job: registrations.job
+                ? {
+                    id: registrations.job.id,
+                    status: registrations.job.status,
+                    requested: registrations.job.requested,
+                    created: registrations.job.created ?? 0,
+                    failed: registrations.job.failed ?? 0,
+                    keys: registrations.job.keys ?? 0,
+                    startedAt: registrations.job.startedAt,
+                    finishedAt: registrations.job.finishedAt ?? null,
+                  }
+                : null,
+            },
+          ];
+        }),
+      ),
+      jevai: {
+        pool: jevaiPool.stats(),
+        running: jevai.job?.status === "running",
+        apiBase: jevaiPool.apiBase,
+        job: jevai.job
+          ? {
+              id: jevai.job.id,
+              status: jevai.job.status,
+              requested: jevai.job.requested,
+              created: jevai.job.created ?? 0,
+              failed: jevai.job.failed ?? 0,
+              keys: jevai.job.keys ?? 0,
+              startedAt: jevai.job.startedAt,
+              finishedAt: jevai.job.finishedAt ?? null,
+            }
+          : null,
+      },
+      proxyscrape: {
+        pool: proxyscrapePool.stats(),
+        running: proxyscrape.job?.status === "running",
+        share: proxyShareStatus(config.dataDir),
+        job: proxyscrape.job
+          ? {
+              id: proxyscrape.job.id,
+              status: proxyscrape.job.status,
+              requested: proxyscrape.job.requested,
+              created: proxyscrape.job.created ?? 0,
+              proxies: proxyscrape.job.proxies ?? 0,
+              failed: proxyscrape.job.failed ?? 0,
+              startedAt: proxyscrape.job.startedAt,
+              finishedAt: proxyscrape.job.finishedAt ?? null,
+            }
+          : null,
+      },
       // 面板读 /api/admin/state 时就能看到这两条线，不用额外请求。
       gabai: {
         pool: gabaiPool.stats(),
@@ -1276,8 +1607,13 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       } catch (cause) {
         return fail(res, cause);
       }
+      const shared = withSharedProxies({ dataDir: config.dataDir, line: "cleverai", proxies: body.proxies });
       try {
-        return sendJson(res, 202, { ok: true, ...cleverai.start(body) });
+        return sendJson(res, 202, {
+          ok: true,
+          proxiesSource: shared.source,
+          ...cleverai.start({ ...body, proxies: shared.proxies }),
+        });
       } catch (cause) {
         return fail(res, cause);
       }
@@ -1415,8 +1751,13 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
       } catch (cause) {
         return fail(res, cause);
       }
+      const shared = withSharedProxies({ dataDir: config.dataDir, line: "gabai", proxies: body.proxies });
       try {
-        return sendJson(res, 202, { ok: true, ...gabai.start(body) });
+        return sendJson(res, 202, {
+          ok: true,
+          proxiesSource: shared.source,
+          ...gabai.start({ ...body, proxies: shared.proxies }),
+        });
       } catch (cause) {
         return fail(res, cause);
       }
@@ -1510,6 +1851,884 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
         return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
       }
       return sendJson(res, 200, { ok: true, pool: gabaiPool.stats() });
+    }
+
+    /* ------------------------------------------------ proxyscrape 号池 + 出口分发 */
+    // 这条线的产物是代理：账号池 + 代理池，外加"把代理分发给别的注册机"。
+    if (path === "/api/admin/proxyscrape/status" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...proxyscrape.status(), share: proxyShareStatus(config.dataDir) });
+    }
+
+    if (path === "/api/admin/proxyscrape/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const shared = withSharedProxies({ dataDir: config.dataDir, line: "proxyscrape", proxies: body.proxies });
+      try {
+        return sendJson(res, 202, {
+          ok: true,
+          proxiesSource: shared.source,
+          ...proxyscrape.start({ ...body, proxies: shared.proxies }),
+        });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/proxyscrape/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...proxyscrape.stop() });
+    }
+
+    if (path === "/api/admin/proxyscrape/pool" && req.method === "GET") {
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      return sendJson(res, 200, {
+        ok: true,
+        schema: proxyscrapePool.toJSON().schema,
+        baseUrl: proxyscrapePool.baseUrl,
+        stats: proxyscrapePool.stats(),
+        accounts: proxyscrapePool.accounts.slice(-limit).map(maskProxyscrapeAccount),
+        proxies: proxyscrapePool.proxies.slice(-limit).map(maskProxyscrapeProxy),
+      });
+    }
+
+    if (path === "/api/admin/proxyscrape/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      if (!email) {
+        return sendJson(res, 400, errorBody("需要 email。", "invalid_request_error", "bad_request"));
+      }
+      const result = proxyscrapePool.add(body);
+      const share = applyProxies({ pool: proxyscrapePool, dataDir: config.dataDir });
+      log("info", `proxyscrape 入池 ${email}（+${result.proxies} 条代理，池内 ${proxyscrapePool.stats().proxies}）`);
+      return sendJson(res, result.created ? 201 : 200, {
+        ok: true,
+        created: result.created,
+        proxies: result.proxies,
+        account: maskProxyscrapeAccount(result.account),
+        share,
+        pool: proxyscrapePool.stats(),
+      });
+    }
+
+    if (path === "/api/admin/proxyscrape/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["proxies", "jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+        ? String(params.get("format"))
+        : "proxies";
+      let result;
+      try {
+        result = proxyscrape.export({ format });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (params.get("download") === "1") {
+        const payload = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "proxyscrape.txt";
+        res.writeHead(200, {
+          "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8",
+          "Content-Length": String(payload.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(payload);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    if (path === "/api/admin/proxyscrape/proxies" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        stats: proxyscrapePool.stats(),
+        proxies: proxyscrapePool.proxies.map(maskProxyscrapeProxy),
+      });
+    }
+
+    const proxyscrapeProxyDelete = /^\/api\/admin\/proxyscrape\/proxies\/(.+)$/.exec(path);
+    if (proxyscrapeProxyDelete && req.method === "DELETE") {
+      const endpoint = decodeURIComponent(proxyscrapeProxyDelete[1]);
+      if (!proxyscrapePool.removeProxy(endpoint)) {
+        return sendJson(res, 404, errorBody("代理池里没有这条。", "invalid_request_error", "not_found"));
+      }
+      applyProxies({ pool: proxyscrapePool, dataDir: config.dataDir });
+      return sendJson(res, 200, { ok: true, pool: proxyscrapePool.stats() });
+    }
+
+    const proxyscrapeAccountDelete = /^\/api\/admin\/proxyscrape\/pool\/([^/]+)$/.exec(path);
+    if (proxyscrapeAccountDelete && req.method === "DELETE") {
+      if (!proxyscrapePool.removeAccount(proxyscrapeAccountDelete[1])) {
+        return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, { ok: true, pool: proxyscrapePool.stats() });
+    }
+
+    // 出口分发：把代理写进 data/proxies/<line>.txt，其它注册机自动吃
+    if (path === "/api/admin/proxies" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        pool: proxyscrapePool.stats(),
+        share: proxyShareStatus(config.dataDir),
+      });
+    }
+
+    if (path === "/api/admin/proxies/apply" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      const lines = Array.isArray(body.lines) && body.lines.length ? body.lines.map(String) : undefined;
+      const share = applyProxies({
+        pool: proxyscrapePool,
+        dataDir: config.dataDir,
+        ...(lines ? { lines } : {}),
+        limitPerLine: Number(body.limitPerLine ?? 0) || 0,
+      });
+      log("info", `proxies: 已分发 ${share.total} 条代理到 ${share.lines.length} 条线`);
+      return sendJson(res, 200, { ok: true, ...share });
+    }
+
+    /* ------------------------------------------- 代理导出 / 订阅（给别的设备） */
+
+    if (path === "/api/admin/proxies/formats" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        defaultFormat: DEFAULT_PROXY_FORMAT,
+        formats: Object.entries(PROXY_FORMATS).map(([id, meta]) => ({ id, ...meta })),
+      });
+    }
+
+    if ((path === "/api/admin/proxies/export" || path === "/api/admin/proxies/download") && (req.method === "GET" || req.method === "POST")) {
+      const format = PROXY_FORMATS[String(params.get("format") ?? "")]
+        ? String(params.get("format"))
+        : DEFAULT_PROXY_FORMAT;
+      const aliveOnly = ["1", "true", "yes"].includes(String(params.get("alive") ?? "").toLowerCase());
+      const limit = Math.max(0, Number(params.get("limit") ?? 0) || 0);
+      let rows = proxyscrapePool.usable().map((proxy) => ({
+        scheme: proxy.scheme,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username,
+        password: proxy.password,
+        status: proxy.status,
+        cooldownUntil: proxy.cooldownUntil ?? 0,
+      }));
+      if (aliveOnly) {
+        const { alive } = await probeProxies(rows, { timeoutMs: 4000, concurrency: 8 });
+        rows = alive.map((item) => item.proxy);
+      }
+      if (limit > 0) rows = rows.slice(0, limit);
+      const body = renderProxies(rows, format, { name: String(params.get("name") ?? "proxyscrape") });
+      const name = proxyExportFileName(format);
+      if (params.get("download") === "1") {
+        const payload = Buffer.from(body, "utf8");
+        res.writeHead(200, {
+          "Content-Type": PROXY_FORMATS[format].contentType,
+          "Content-Length": String(payload.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(payload);
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        format,
+        rows: rows.length,
+        aliveOnly,
+        body,
+        formats: Object.keys(PROXY_FORMATS),
+      });
+    }
+
+    if (path === "/api/admin/proxies/check" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      const timeoutMs = Math.min(15000, Math.max(500, Number(body.timeoutMs ?? 4000) || 4000));
+      const concurrency = Math.min(32, Math.max(1, Number(body.concurrency ?? 8) || 8));
+      const rows = proxyscrapePool.usable().map((proxy) => ({
+        endpoint: proxy.endpoint,
+        scheme: proxy.scheme,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username,
+        password: proxy.password,
+      }));
+      const { alive, dead } = await probeProxies(rows, { timeoutMs, concurrency });
+      for (const item of alive) proxyscrapePool.recordProxy(item.proxy.endpoint, { ok: true });
+      for (const item of dead) {
+        proxyscrapePool.recordProxy(item.proxy.endpoint, { ok: false, error: item.error ?? "unreachable" });
+      }
+      log("info", `proxies: 探测 ${rows.length} 条，活 ${alive.length}，死 ${dead.length}`);
+      return sendJson(res, 200, {
+        ok: true,
+        total: rows.length,
+        alive: alive.length,
+        dead: dead.length,
+        pool: proxyscrapePool.stats(),
+        results: [...alive, ...dead].map((item) => ({
+          endpoint: `${item.proxy.scheme ?? "http"}://${item.proxy.host}:${item.proxy.port}`,
+          ok: item.ok,
+          ms: item.ms,
+          error: item.error ?? null,
+        })),
+      });
+    }
+
+    if (path === "/api/admin/proxies/shares" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        publicBase,
+        shares: proxyShares.list().map((share) => ({
+          ...maskProxyShare(share),
+          url: share.revoked ? null : shareUrlFor(share.token),
+        })),
+      });
+    }
+
+    if (path === "/api/admin/proxies/share" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      const minted = proxyShares.mint({
+        name: String(body.name ?? ""),
+        format: String(body.format ?? DEFAULT_PROXY_FORMAT),
+        note: String(body.note ?? ""),
+      });
+      return sendJson(res, minted.reused ? 200 : 201, {
+        ok: true,
+        reused: minted.reused,
+        share: maskProxyShare(minted),
+        token: minted.token,
+        url: shareUrlFor(minted.token),
+        format: minted.format,
+      });
+    }
+
+    const shareDelete = /^\/api\/admin\/proxies\/shares\/([^/]+)$/.exec(path);
+    if (shareDelete && req.method === "DELETE") {
+      const target = decodeURIComponent(shareDelete[1]);
+      const hard = ["1", "true"].includes(String(params.get("purge") ?? "").toLowerCase());
+      // 面板只拿得到打码令牌，所以也允许按 name 撤销
+      const share = proxyShares.find(target) ?? proxyShares.list().find((row) => row.name === target) ?? null;
+      if (!share) {
+        return sendJson(res, 404, errorBody("没有这条订阅。", "invalid_request_error", "not_found"));
+      }
+      const done = hard ? proxyShares.remove(share.token) : proxyShares.revoke(share.token);
+      if (!done) {
+        return sendJson(res, 404, errorBody("没有这条订阅。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        purged: hard,
+        name: share.name,
+        shares: proxyShares.list().map(maskProxyShare),
+      });
+    }
+
+    /* --------------------------------------------------------- jevai 号池 */
+    if (path === "/api/admin/jevai/status" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, ...jevai.status(), relay: jevaiRelay.status() });
+    }
+
+    if (path === "/api/admin/jevai/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...jevai.start(body) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    // 每日签到：jev 的免费额度主要靠这个积累（号越多，日额度越高）
+    if (path === "/api/admin/jevai/checkin" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...jevai.checkin(body) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/jevai/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...jevai.stop() });
+    }
+
+    if (path === "/api/admin/jevai/pool" && req.method === "GET") {
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      return sendJson(res, 200, {
+        ok: true,
+        schema: jevaiPool.toJSON().schema,
+        baseUrl: jevaiPool.baseUrl,
+        apiBase: jevaiPool.apiBase,
+        stats: jevaiPool.stats(),
+        accounts: jevaiPool.accounts.slice(-limit).map(maskJevaiAccount),
+      });
+    }
+
+    if (path === "/api/admin/jevai/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      const apiKey = String(body.apiKey ?? body.api_key ?? "").trim();
+      if (!email || !apiKey) {
+        return sendJson(res, 400, errorBody("需要 email 与 apiKey。", "invalid_request_error", "bad_request"));
+      }
+      const { account, created, gatewayKey } = importJevaiAccount({
+        pool: jevaiPool,
+        store,
+        record: body,
+        mintKey: body.mintKey !== false,
+      });
+      const applied = jevai.apply();
+      log("info", `jevai 入池 ${email}（号池 ${jevaiPool.size}，Key ${jevaiPool.keys().length}）`);
+      return sendJson(res, created ? 201 : 200, {
+        ok: true,
+        created,
+        account: maskJevaiAccount(account),
+        gatewayKey: gatewayKey
+          ? { id: gatewayKey.id, label: gatewayKey.label, prefix: gatewayKey.prefix, plaintext: gatewayKey.plaintext }
+          : null,
+        apply: applied,
+        pool: jevaiPool.stats(),
+      });
+    }
+
+    if (path === "/api/admin/jevai/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["keys", "jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+        ? String(params.get("format"))
+        : "keys";
+      let result;
+      try {
+        result = jevai.export({ format });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (params.get("download") === "1") {
+        const payload = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "jevai-keys.txt";
+        res.writeHead(200, {
+          "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8",
+          "Content-Length": String(payload.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(payload);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    if (path === "/api/admin/jevai/keys" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        apiBase: jevaiPool.apiBase,
+        keys: jevaiPool.accounts.map((account) => ({
+          email: account.email,
+          apiKeyPreview: account.apiKey ? `${account.apiKey.slice(0, 12)}…` : "",
+          emailVerified: account.emailVerified,
+          gatewayKey: account.gatewayKey
+            ? { id: account.gatewayKey.id, label: account.gatewayKey.label, prefix: account.gatewayKey.prefix }
+            : null,
+        })),
+      });
+    }
+
+    // 自动接入其它工具：写 data/keys/jevai.{txt,json}，并回接入信息
+    if (path === "/api/admin/jevai/apply" && req.method === "POST") {
+      try {
+        const applied = jevai.apply();
+        return sendJson(res, 200, {
+          ok: true,
+          ...applied,
+          connect: jevaiRelay.connection(),
+          pool: jevaiPool.stats(),
+        });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/jevai/connect" && req.method === "GET") {
+      const base = String(config.publicBase ?? "").replace(/\/+$/, "");
+      const usable = store.listKeys().filter((key) => !key.revoked);
+      return sendJson(res, 200, {
+        ok: true,
+        ...jevaiRelay.connection(),
+        gatewayBase: `${base}/jevai/v1`,
+        upstreamBase: jevaiPool.apiBase,
+        gatewayKeyPrefix: usable[0]?.prefix ?? "",
+        gatewayKeys: usable.length,
+      });
+    }
+
+    const jevaiDelete = /^\/api\/admin\/jevai\/pool\/([^/]+)$/.exec(path);
+    if (jevaiDelete && req.method === "DELETE") {
+      if (!jevaiPool.remove(jevaiDelete[1])) {
+        return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+      }
+      return sendJson(res, 200, { ok: true, pool: jevaiPool.stats() });
+    }
+
+    /* ------------------------------------------- 六条 OpenAI 兼容线的管理面 */
+    // 一条代码路径服务六条线：/api/admin/<line>/{status,register,register/stop,pool,pool/import,pool/export,keys,apply,connect}
+    const lineAdminPrefix = Object.keys(LINE_ROUTE_LITERALS).find((id) => path.startsWith(`/api/admin/${id}/`));
+    if (lineAdminPrefix) {
+      const line = lineById(lineAdminPrefix);
+      const pool = linePools.get(lineAdminPrefix);
+      const registrations = lineRegs.get(lineAdminPrefix);
+      const relay = lineRelays.get(lineAdminPrefix);
+      const rest = path.slice(`/api/admin/${lineAdminPrefix}/`.length);
+
+      if (rest === "status" && req.method === "GET") {
+        return sendJson(res, 200, { ok: true, ...registrations.status(), relay: relay.status() });
+      }
+      if (rest === "register" && req.method === "POST") {
+        let body = {};
+        try {
+          body = await readJson(req);
+        } catch (cause) {
+          return fail(res, cause);
+        }
+        try {
+          return sendJson(res, 202, { ok: true, ...registrations.start(body) });
+        } catch (cause) {
+          return fail(res, cause);
+        }
+      }
+      if (rest === "register/stop" && req.method === "POST") {
+        return sendJson(res, 200, { ok: true, ...registrations.stop() });
+      }
+      if (rest === "pool" && req.method === "GET") {
+        const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+        return sendJson(res, 200, {
+          ok: true,
+          line: line.id,
+          schema: line.schema,
+          apiBase: line.apiBase,
+          anonymous: line.anonymous === true,
+          freeSuffix: line.freeSuffix || null,
+          stats: pool.stats(),
+          accounts: pool.accounts.slice(-limit).map(maskLineAccount),
+        });
+      }
+      if (rest === "pool/import" && req.method === "POST") {
+        let body;
+        try {
+          body = await readJson(req);
+        } catch (cause) {
+          return fail(res, cause);
+        }
+        const email = String(body.email ?? "").trim();
+        const apiKey = String(body.apiKey ?? body.api_key ?? "").trim();
+        if (!email || (!apiKey && line.anonymous !== true)) {
+          return sendJson(res, 400, errorBody("需要 email 与 apiKey。", "invalid_request_error", "bad_request"));
+        }
+        const { account, created, gatewayKey } = importLineAccount({
+          line,
+          pool,
+          store,
+          record: body,
+          mintKey: body.mintKey !== false,
+        });
+        const applied = registrations.apply();
+        return sendJson(res, created ? 201 : 200, {
+          ok: true,
+          line: line.id,
+          created,
+          account: maskLineAccount(account),
+          gatewayKey: gatewayKey
+            ? { id: gatewayKey.id, label: gatewayKey.label, prefix: gatewayKey.prefix, plaintext: gatewayKey.plaintext }
+            : null,
+          apply: applied,
+          pool: pool.stats(),
+        });
+      }
+      if (rest === "pool/export" && (req.method === "POST" || req.method === "GET")) {
+        const format = ["keys", "jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+          ? String(params.get("format"))
+          : "keys";
+        let result;
+        try {
+          result = registrations.export({ format });
+        } catch (cause) {
+          return fail(res, cause);
+        }
+        if (params.get("download") === "1") {
+          const payload = readFileSync(result.file);
+          const name = result.file.split(/[\\/]/).pop() ?? `${line.id}-keys.txt`;
+          res.writeHead(200, {
+            "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8",
+            "Content-Length": String(payload.length),
+            "Content-Disposition": `attachment; filename="${name}"`,
+            "Cache-Control": "no-store",
+          });
+          return res.end(payload);
+        }
+        return sendJson(res, 200, { ok: true, line: line.id, ...result });
+      }
+      if (rest === "keys" && req.method === "GET") {
+        return sendJson(res, 200, {
+          ok: true,
+          line: line.id,
+          apiBase: line.apiBase,
+          keyPrefix: line.keyPrefix,
+          keys: pool.accounts.map((account) => ({
+            email: account.email,
+            apiKeyPreview: account.apiKey ? `${account.apiKey.slice(0, 10)}…` : "",
+            emailVerified: account.emailVerified,
+            gatewayKey: account.gatewayKey
+              ? { id: account.gatewayKey.id, label: account.gatewayKey.label, prefix: account.gatewayKey.prefix }
+              : null,
+          })),
+        });
+      }
+      if (rest === "apply" && req.method === "POST") {
+        try {
+          const applied = registrations.apply();
+          return sendJson(res, 200, { ok: true, line: line.id, ...applied, connect: relay.status(), pool: pool.stats() });
+        } catch (cause) {
+          return fail(res, cause);
+        }
+      }
+      if (rest === "connect" && req.method === "GET") {
+        const base = String(config.publicBase ?? "").replace(/\/+$/, "");
+        const usable = store.listKeys().filter((key) => !key.revoked);
+        return sendJson(res, 200, {
+          ok: true,
+          line: line.id,
+          gatewayBase: `${base}${line.relayPrefix}`,
+          upstreamBase: line.apiBase,
+          keyPrefix: line.keyPrefix,
+          anonymous: line.anonymous === true,
+          gatewayKeyPrefix: usable[0]?.prefix ?? "",
+          keys: pool.keys().length,
+        });
+      }
+      const accountDelete = /^pool\/([^/]+)$/.exec(rest);
+      if (accountDelete && req.method === "DELETE") {
+        if (!pool.remove(accountDelete[1])) {
+          return sendJson(res, 404, errorBody("号池里没有这个账号。", "invalid_request_error", "not_found"));
+        }
+        return sendJson(res, 200, { ok: true, line: line.id, pool: pool.stats() });
+      }
+      return sendJson(res, 404, errorBody(`No ${line.id} admin route for ${rest}.`, "invalid_request_error", "not_found"));
+    }
+
+    // 六条线的总览（面板侧边栏用）
+    if (path === "/api/admin/lines" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        lines: OPENAI_LINES.map((line) => {
+          const pool = linePools.get(line.id);
+          const registrations = lineRegs.get(line.id);
+          return {
+            id: line.id,
+            name: line.name,
+            schema: line.schema,
+            apiBase: line.apiBase,
+            relayPrefix: line.relayPrefix,
+            keyPrefix: line.keyPrefix,
+            freeSuffix: line.freeSuffix || null,
+            anonymous: line.anonymous === true,
+            anthropic: line.anthropic === true,
+            models: line.models,
+            stats: pool.stats(),
+            running: registrations.job?.status === "running",
+            job: registrations.job
+              ? {
+                  id: registrations.job.id,
+                  status: registrations.job.status,
+                  requested: registrations.job.requested,
+                  created: registrations.job.created ?? 0,
+                  failed: registrations.job.failed ?? 0,
+                  keys: registrations.job.keys ?? 0,
+                  startedAt: registrations.job.startedAt,
+                  finishedAt: registrations.job.finishedAt ?? null,
+                }
+              : null,
+          };
+        }),
+      });
+    }
+
+    /* --------------------------------------------------- Turnstile 求解器 */
+    // 本地 captcha-solver（tools/captcha-solver）：注册页有人机验证的线都靠它
+    if (path === "/api/admin/captcha/status" && req.method === "GET") {
+      const status = await solverStatus({ solverUrl: String(params.get("url") ?? "") });
+      return sendJson(res, 200, { ok: status.ok, solverUrl: status.url, status });
+    }
+
+    if (path === "/api/admin/captcha/solve" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        const solved = await solveTurnstile({
+          url: String(body.url ?? ""),
+          sitekey: String(body.sitekey ?? ""),
+          action: String(body.action ?? ""),
+          cdata: String(body.cdata ?? ""),
+          solverUrl: String(body.solverUrl ?? ""),
+          timeoutMs: Math.min(600_000, Math.max(5_000, Number(body.timeoutMs ?? 180_000))),
+        });
+        return sendJson(res, 200, { ok: true, ...solved });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    /* --------------------------------------------- AMD 开发者云（GPU 实例） */
+    if (path === "/api/admin/amd/status" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        ...amdRegistrations.status(),
+        instances: amdInstanceSummary(amdPool),
+        apiBase: AMD_LINE.apiBase,
+      });
+    }
+
+    if (path === "/api/admin/amd/register" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      try {
+        return sendJson(res, 202, { ok: true, ...amdRegistrations.start(body) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/amd/register/stop" && req.method === "POST") {
+      return sendJson(res, 200, { ok: true, ...amdRegistrations.stop() });
+    }
+
+    if (path === "/api/admin/amd/pool" && req.method === "GET") {
+      const limit = Math.min(500, Math.max(1, Number(params.get("limit") ?? 200)));
+      return sendJson(res, 200, {
+        ok: true,
+        line: "amd",
+        schema: AMD_LINE.schema,
+        apiBase: AMD_LINE.apiBase,
+        stats: amdPool.stats(),
+        instances: amdInstanceSummary(amdPool),
+        accounts: amdPool.accounts.slice(-limit).map(maskLineAccount),
+      });
+    }
+
+    if (path === "/api/admin/amd/pool/import" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      const cookie = String(body.apiKey ?? body.cookie ?? "").trim();
+      if (!email || !cookie) {
+        return sendJson(res, 400, errorBody("需要 email 与 cookie（apiKey 字段）。", "invalid_request_error", "bad_request"));
+      }
+      const { account, created, gatewayKey } = importLineAccount({
+        line: AMD_LINE,
+        pool: amdPool,
+        store,
+        record: { ...body, apiKey: cookie },
+        mintKey: body.mintKey !== false,
+      });
+      const applied = amdRegistrations.apply();
+      return sendJson(res, created ? 201 : 200, {
+        ok: true,
+        line: "amd",
+        created,
+        account: maskLineAccount(account),
+        gatewayKey: gatewayKey
+          ? { id: gatewayKey.id, label: gatewayKey.label, prefix: gatewayKey.prefix, plaintext: gatewayKey.plaintext }
+          : null,
+        apply: applied,
+        instances: amdInstanceSummary(amdPool),
+      });
+    }
+
+    if (path === "/api/admin/amd/pool/export" && (req.method === "POST" || req.method === "GET")) {
+      const format = ["keys", "jsonl", "csv", "pool"].includes(String(params.get("format") ?? ""))
+        ? String(params.get("format"))
+        : "keys";
+      let result;
+      try {
+        result = amdRegistrations.export({ format });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      if (params.get("download") === "1") {
+        const payload = readFileSync(result.file);
+        const name = result.file.split(/[\\/]/).pop() ?? "amd-cookies.txt";
+        res.writeHead(200, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(payload.length),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        });
+        return res.end(payload);
+      }
+      return sendJson(res, 200, { ok: true, line: "amd", ...result });
+    }
+
+    // 自动刷课：拿 Devpoints → 换 GPU 小时（AMD 的"通过审核"主要靠学院课程 + 活动）
+    if (path === "/api/admin/amd/study" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      const account = email ? amdPool.byEmail(email) : amdPool.accounts[0];
+      if (!account) {
+        return sendJson(res, 400, errorBody("池里没有账号：先导入 cookie。", "invalid_request_error", "no_account"));
+      }
+      const args = ["--cookie", String(account.apiKey ?? ""), "--email", account.email];
+      const num = (value, fallback) => (Number.isFinite(Number(value)) ? String(Number(value)) : String(fallback));
+      args.push("--step", num(body.step, 30), "--target", num(body.target, 3600));
+      args.push("--pause", num(body.pause, 1), "--max-calls", num(body.maxCalls, 400));
+      if (body.course) args.push("--course", String(body.course));
+      if (body.limit) args.push("--limit", num(body.limit, 0));
+      if (body.force) args.push("--force");
+      try {
+        return sendJson(res, 202, { ok: true, email: account.email, ...amdRegistrations.runSubcommand("study", { args, requested: 1, mode: "study" }) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    // 考试：取题 / 交卷 / 自动答题（挂后台任务，日志走 job.lines）
+    if (path === "/api/admin/amd/exam" && req.method === "POST") {
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const email = String(body.email ?? "").trim();
+      const account = email ? amdPool.byEmail(email) : amdPool.accounts[0];
+      if (!account) {
+        return sendJson(res, 400, errorBody("池里没有账号：先导入 cookie。", "invalid_request_error", "no_account"));
+      }
+      const courseId = String(body.course ?? "").trim();
+      if (!courseId) {
+        return sendJson(res, 400, errorBody("需要 course（课程 id）。", "invalid_request_error", "bad_request"));
+      }
+      const args = ["--course", courseId, "--cookie", String(account.apiKey ?? ""), "--email", account.email];
+      if (body.child) args.push("--child", String(body.child));
+      if (body.auto !== false) args.push("--auto", "--strategy", String(body.strategy ?? "first"));
+      args.push("--rounds", String(Number(body.rounds ?? 3)));
+      if (body.submit === true) args.push("--submit");
+      try {
+        return sendJson(res, 202, {
+          ok: true,
+          email: account.email,
+          course: courseId,
+          ...amdRegistrations.runSubcommand("exam", { args, requested: 1, mode: "exam" }),
+        });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    // 算力券：汇总（vouchers）/ 兑换（exchange）/ 免费模型（models）/ 累加到主号（consolidate）
+    for (const [route, sub, mode] of [
+      ["vouchers", "vouchers", "vouchers"],
+      ["exchange", "exchange", "exchange"],
+      ["models", "models", "models"],
+      ["consolidate", "consolidate", "consolidate"],
+    ]) {
+      if (path !== `/api/admin/amd/${route}` || req.method !== "POST") continue;
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const args = [];
+      const email = String(body.email ?? "").trim();
+      if (email) args.push("--email", email);
+      if (body.master) args.push("--master", String(body.master));
+      if (body.redeem === true) args.push("--redeem");
+      if (body.dryRun === true) args.push("--dry-run");
+      if (body.amount) args.push("--amount", String(Number(body.amount)));
+      if (body.extra) args.push("--extra", JSON.stringify(body.extra));
+      try {
+        return sendJson(res, 202, {
+          ok: true,
+          route,
+          ...amdRegistrations.runSubcommand(sub, { args, requested: 1, mode }),
+        });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+    }
+
+    if (path === "/api/admin/amd/courses" && req.method === "GET") {
+      const email = String(params.get("email") ?? "").trim();
+      const account = email ? amdPool.byEmail(email) : amdPool.accounts[0];
+      if (!account) {
+        return sendJson(res, 400, errorBody("池里没有账号：先导入 cookie。", "invalid_request_error", "no_account"));
+      }
+      const run = spawnSync(
+        amdRegistrations.python,
+        ["-m", AMD_LINE.pyModule, "courses", "--json", "--cookie", String(account.apiKey ?? ""), "--email", account.email],
+        { cwd: amdRegistrations.toolDir, encoding: "utf8", timeout: 60_000, windowsHide: true },
+      );
+      if (run.status !== 0) {
+        return sendJson(res, 502, errorBody((run.stderr || run.stdout || "courses 调用失败").slice(0, 300), "upstream_error", "courses_failed"));
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(run.stdout);
+      } catch {
+        parsed = { raw: (run.stdout || "").slice(0, 400) };
+      }
+      return sendJson(res, 200, { ok: true, email: account.email, courses: parsed });
+    }
+
+    if (path === "/api/admin/amd/apply" && req.method === "POST") {
+      try {
+        const applied = amdRegistrations.apply();
+        return sendJson(res, 200, { ok: true, line: "amd", ...applied, instances: amdInstanceSummary(amdPool) });
+      } catch (cause) {
+        return fail(res, cause);
+      }
     }
 
     if (path === "/api/admin/exchange" && req.method === "POST") {
@@ -1748,6 +2967,35 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
           healthy: gabaiPool.healthy().length,
           keys: gabaiPool.keyed().length,
         },
+        proxyscrape: {
+          accounts: proxyscrapePool.size,
+          proxies: proxyscrapePool.stats().proxies,
+          activeProxies: proxyscrapePool.stats().activeProxies,
+        },
+        amd: {
+          accounts: amdPool.size,
+          instances: amdInstanceSummary(amdPool).withInstance,
+          points: amdInstanceSummary(amdPool).totalPoints,
+        },
+        jevai: {
+          accounts: jevaiPool.size,
+          healthy: jevaiPool.healthy().length,
+          keys: jevaiPool.keys().length,
+        },
+        ...Object.fromEntries(
+          OPENAI_LINES.map((line) => {
+            const pool = linePools.get(line.id);
+            return [
+              line.id,
+              {
+                accounts: pool.size,
+                healthy: pool.healthy().length,
+                keys: pool.keys().length,
+                anonymous: line.anonymous === true,
+              },
+            ];
+          }),
+        ),
         requests: stats.requests,
         streams: stats.streams,
         uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
@@ -1768,6 +3016,41 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
     if (path.startsWith("/p/")) {
       const handled = await providerRuntime.relay.handle(req, res, url, { auth: authorizeApi(req, url) });
       if (handled) return;
+    }
+
+    // 代理订阅（公开面，用令牌鉴权）：手机/路由器/别的电脑直接拉这个 URL。
+    // 令牌只能读到代理，读不到账号、Key 或其它管理数据；可随时撤销。
+    const proxyShareMatch = /^\/proxy\/([A-Za-z0-9_-]{8,})$/.exec(path);
+    if (proxyShareMatch && (req.method === "GET" || req.method === "HEAD")) {
+      const token = proxyShareMatch[1];
+      const share = proxyShares.find(token);
+      if (!share || share.revoked) {
+        return sendJson(res, 404, errorBody("订阅不存在或已撤销。", "invalid_request_error", "not_found"));
+      }
+      const requested = String(url.searchParams.get("format") ?? "");
+      const format = PROXY_FORMATS[requested] ? requested : share.format;
+      const rows = proxyscrapePool.usable().map((proxy) => ({
+        scheme: proxy.scheme,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username,
+        password: proxy.password,
+        status: proxy.status,
+        cooldownUntil: proxy.cooldownUntil ?? 0,
+      }));
+      const body = renderProxies(rows, format, { name: share.name });
+      proxyShares.touch(token, { format });
+      const download = ["1", "true"].includes(String(url.searchParams.get("download") ?? "").toLowerCase());
+      res.writeHead(200, {
+        "Content-Type": PROXY_FORMATS[format].contentType,
+        "Content-Length": String(Buffer.byteLength(body)),
+        "Cache-Control": "no-store",
+        // 订阅客户端（Clash / sing-box）用这个决定多久回拉一次
+        "Profile-Update-Interval": "6",
+        "X-Proxy-Count": String(rows.length),
+        ...(download ? { "Content-Disposition": `attachment; filename="${proxyExportFileName(format)}"` } : {}),
+      });
+      return res.end(req.method === "HEAD" ? "" : body);
     }
 
     // ---- authenticated surfaces ----
@@ -1806,6 +3089,142 @@ export function createGateway({ config, lane, store, scheduler, log = () => {} }
 
     const limited = enforceKeyLimits(auth);
     if (limited) return sendJson(res, limited.status, limited.body, limited.headers);
+
+    // 六条 OpenAI 兼容线的反代面：/<line>/v1/*（鉴权在上面的 auth 里做过）
+    const relayLine = OPENAI_LINES.find((line) => path.startsWith(line.relayPrefix));
+    if (relayLine && path.startsWith(relayLine.relayPrefix)) {
+      const upstreamPath = `/${path.slice(relayLine.relayPrefix.length - 1)}`; // "/v1/chat/completions"
+      const relay = lineRelays.get(relayLine.id);
+      let body = null;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        try {
+          body = Buffer.from(await readBody(req));
+        } catch (cause) {
+          return fail(res, cause);
+        }
+      }
+      stats.requests++;
+      let result;
+      try {
+        const controller = new AbortController();
+        res.on("close", () => controller.abort());
+        result = await relay.forward(req, upstreamPath, { body, headers: req.headers, signal: controller.signal });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const { response, account } = result;
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        const explained = explainModelError(relayLine, response.status, text);
+        if (explained) {
+          return sendJson(res, response.status, explained, { "X-Line-Account": String(account.id) });
+        }
+        return sendJson(
+          res,
+          response.status,
+          errorBody(text.slice(0, 400) || `上游 HTTP ${response.status}`, "upstream_error"),
+          { "X-Line-Account": String(account.id) },
+        );
+      }
+      const contentType = response.headers.get("content-type") ?? "application/json";
+      if (contentType.includes("text/event-stream")) stats.streams++;
+      res.writeHead(200, {
+        "Content-Type": contentType,
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+        "X-Line": relayLine.id,
+        "X-Line-Account": String(account.id),
+      });
+      if (!response.body) return res.end();
+      try {
+        for await (const chunk of response.body) {
+          if (res.writableEnded) break;
+          if (!res.write(chunk)) {
+            await new Promise((resolve) => {
+              res.once("drain", resolve);
+              res.once("close", resolve);
+            });
+          }
+        }
+      } catch (cause) {
+        log("error", `${relayLine.id} stream failed: ${cause?.message ?? cause}`);
+        if (!res.writableEnded) res.destroy();
+        return;
+      }
+      if (!res.writableEnded) res.end();
+      return;
+    }
+
+    // jev-ai.org 反代面：/jevai/v1/*。上游说 OpenAI 形状（models / systemone …），
+    // 所以只换 Authorization + 轮询 + 故障切换；未知端点会翻成人话。
+    if (path === "/jevai" || path.startsWith("/jevai/")) {
+      const upstreamPath = path.slice("/jevai".length) || "/v1/models";
+      if (!upstreamPath.startsWith("/v1/")) {
+        return sendJson(res, 404, errorBody(`No jevai route for ${path}.`, "invalid_request_error", "not_found"));
+      }
+      let body = null;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        try {
+          body = Buffer.from(await readBody(req));
+        } catch (cause) {
+          return fail(res, cause);
+        }
+      }
+      stats.requests++;
+      let result;
+      try {
+        result = await jevaiRelay.forward(req, upstreamPath, {
+          body,
+          headers: req.headers,
+          signal: (() => {
+            const controller = new AbortController();
+            res.on("close", () => controller.abort());
+            return controller.signal;
+          })(),
+        });
+      } catch (cause) {
+        return fail(res, cause);
+      }
+      const { response, account } = result;
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        const explained = explainUpstreamError(response.status, text);
+        if (explained) {
+          return sendJson(res, response.status, explained, { "X-Jevai-Account": String(account.id) });
+        }
+        return sendJson(res, response.status, errorBody(text.slice(0, 400) || `上游 HTTP ${response.status}`, "upstream_error"), {
+          "X-Jevai-Account": String(account.id),
+        });
+      }
+      const contentType = response.headers.get("content-type") ?? "application/json";
+      if (contentType.includes("text/event-stream")) stats.streams++;
+      res.writeHead(200, {
+        "Content-Type": contentType,
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+        "X-Jevai-Account": String(account.id),
+      });
+      if (!response.body) {
+        return res.end();
+      }
+      try {
+        for await (const chunk of response.body) {
+          if (res.writableEnded) break;
+          if (!res.write(chunk)) {
+            await new Promise((resolve) => {
+              res.once("drain", resolve);
+              res.once("close", resolve);
+            });
+          }
+        }
+      } catch (cause) {
+        log("error", `jevai stream failed: ${cause?.message ?? cause}`);
+        if (!res.writableEnded) res.destroy();
+        return;
+      }
+      if (!res.writableEnded) res.end();
+      return;
+    }
 
     // gab.ai 反代面：/gab/v1/*。上游本来就是 OpenAI / Anthropic 形状，直通，
     // 只把 Authorization 换成号池里的 `gab_…` key，并做轮询 + 故障切换。

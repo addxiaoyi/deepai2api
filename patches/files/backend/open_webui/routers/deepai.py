@@ -766,6 +766,31 @@ async def pools_overview(user=Depends(get_admin_user)):
             "proxy_base": "/gab/v1",
         }
     )
+    jevai = health.get("jevai") or {}
+    lines.append(
+        {
+            "id": "jevai",
+            "label": "JEV AI",
+            "accounts": jevai.get("accounts", 0),
+            "healthy": jevai.get("healthy", 0),
+            "keys": jevai.get("keys", 0),
+            "proxy_base": "/jevai/v1",
+        }
+    )
+    proxyscrape = health.get("proxyscrape") or {}
+    lines.append(
+        {
+            "id": "proxyscrape",
+            "label": "ProxyScrape 代理池",
+            "accounts": proxyscrape.get("accounts", 0),
+            # 这条线的"健康"就是可用代理数
+            "healthy": proxyscrape.get("activeProxies", 0),
+            "keys": 0,
+            # 产物是出口，没有反代面
+            "proxy_base": "",
+            "extra": {"proxies": proxyscrape.get("proxies", 0)},
+        }
+    )
     return {"gateway": await get_gateway_url(), "lines": lines}
 
 
@@ -954,3 +979,453 @@ async def gabai_connect_info(user=Depends(get_admin_user)):
         "key_prefix": (usable[0].get("prefix") if usable else "") or "",
         "keys": len(usable),
     }
+
+
+# --------------------------------------------------------- proxyscrape 代理池
+#
+# 产物是**出口**而不是模型通道：注册领 premium 试用 → 试用给出代理 → 写进代理池
+# → `applyProxies()` 分发成 data/proxies/<line>.txt，别的注册机自动吃。
+# 所以这一组没有反代面，只有管理面 + 分发。
+
+
+class ProxyscrapeRegisterForm(BaseModel):
+    count: int = 1
+    concurrency: int = 1
+    mail_provider: str = "imap"
+    mail_domains: list[str] = []
+    captcha: str = "browser"  # browser | capsolver | manual | none
+    captcha_key: Optional[str] = None
+    engine: str = "auto"
+    browser_stack: str = "auto"
+    proxies: list[str] = []
+    headful: bool = False
+    verify_email: bool = True
+    claim_trial: bool = True
+    export: Optional[str] = None
+
+
+@router.get("/proxyscrape/status")
+async def proxyscrape_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/proxyscrape/status", timeout=30)
+
+
+@router.post("/proxyscrape/register")
+async def proxyscrape_register(form_data: ProxyscrapeRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "captcha": form_data.captcha,
+        "captchaKey": form_data.captcha_key,
+        "engine": form_data.engine,
+        "browserStack": form_data.browser_stack,
+        "proxies": form_data.proxies,
+        "headful": form_data.headful,
+        "verifyEmail": form_data.verify_email,
+        "claimTrial": form_data.claim_trial,
+        "export": form_data.export,
+    }
+    return await gw("/api/admin/proxyscrape/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/proxyscrape/register/stop")
+async def proxyscrape_register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/proxyscrape/register/stop", method="POST", timeout=30)
+
+
+@router.get("/proxyscrape/pool")
+async def proxyscrape_pool(limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/proxyscrape/pool?limit={limit}", timeout=30)
+
+
+@router.get("/proxyscrape/proxies")
+async def proxyscrape_proxies(user=Depends(get_admin_user)):
+    return await gw("/api/admin/proxyscrape/proxies", timeout=30)
+
+
+@router.post("/proxyscrape/pool/export")
+async def proxyscrape_pool_export(
+    format: str = "proxies", download: int = 0, user=Depends(get_admin_user)
+):
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/proxyscrape/pool/export{query}")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="proxyscrape.{format}"'},
+        )
+    return await gw(f"/api/admin/proxyscrape/pool/export{query}", method="POST", timeout=30)
+
+
+@router.get("/proxies")
+async def proxy_share_status(user=Depends(get_admin_user)):
+    """出口分发状态：每条线现在分到几条代理。"""
+    return await gw("/api/admin/proxies", timeout=30)
+
+
+@router.post("/proxies/apply")
+async def proxy_share_apply(form_data: dict, user=Depends(get_admin_user)):
+    """把代理池分发给注册机（可指定 lines / limitPerLine）。"""
+    return await gw("/api/admin/proxies/apply", method="POST", json_body=form_data or {}, timeout=30)
+
+# --------------------------------------------------- 代理导出 / 订阅（给别的设备）
+
+
+class ProxyShareForm(BaseModel):
+    name: str = ""
+    format: str = "url"
+    note: str = ""
+
+
+@router.get("/proxies/formats")
+async def proxy_formats(user=Depends(get_admin_user)):
+    """可用的导出格式（面板下拉用）。"""
+    return await gw("/api/admin/proxies/formats", timeout=20)
+
+
+@router.get("/proxies/export")
+async def proxy_export(
+    format: str = "url",
+    alive: int = 0,
+    limit: int = 0,
+    download: int = 0,
+    user=Depends(get_admin_user),
+):
+    """把代理池渲染成给别的设备用的形状；`download=1` 直接下发文件。"""
+    query = f"?format={format}&alive={alive}&limit={limit}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/proxies/download{query}")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="proxyscrape-{format}"'},
+        )
+    return await gw(f"/api/admin/proxies/export{query}", timeout=60)
+
+
+@router.post("/proxies/check")
+async def proxy_check(form_data: dict, user=Depends(get_admin_user)):
+    """TCP 探测一遍，死的进冷却。"""
+    return await gw("/api/admin/proxies/check", method="POST", json_body=form_data or {}, timeout=120)
+
+
+@router.get("/proxies/shares")
+async def proxy_shares(user=Depends(get_admin_user)):
+    return await gw("/api/admin/proxies/shares", timeout=20)
+
+
+@router.post("/proxies/share")
+async def proxy_share_mint(form_data: ProxyShareForm, user=Depends(get_admin_user)):
+    """生成/复用一条订阅链接（手机、路由器、别的电脑直接用）。"""
+    return await gw(
+        "/api/admin/proxies/share",
+        method="POST",
+        json_body={"name": form_data.name, "format": form_data.format, "note": form_data.note},
+        timeout=20,
+    )
+
+
+@router.delete("/proxies/shares/{token}")
+async def proxy_share_revoke(token: str, purge: int = 0, user=Depends(get_admin_user)):
+    return await gw(
+        f"/api/admin/proxies/shares/{token}?purge={purge}", method="DELETE", timeout=20
+    )
+
+# ------------------------------------------------------ jev-ai.org Key 池
+
+
+class JevaiRegisterForm(BaseModel):
+    count: int = 1
+    concurrency: int = 1
+    mail_provider: str = "imap"
+    mail_domains: list[str] = []
+    key_name: str = ""
+    proxies: list[str] = []
+    verify_email: bool = True
+    checkin: bool = True
+    export: Optional[str] = None
+
+
+@router.get("/jevai/status")
+async def jevai_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/jevai/status", timeout=30)
+
+
+@router.post("/jevai/register")
+async def jevai_register(form_data: JevaiRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "keyName": form_data.key_name,
+        "proxies": form_data.proxies,
+        "verifyEmail": form_data.verify_email,
+        "checkin": form_data.checkin,
+        "export": form_data.export,
+    }
+    return await gw("/api/admin/jevai/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/jevai/register/stop")
+async def jevai_register_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/jevai/register/stop", method="POST", timeout=30)
+
+
+@router.get("/jevai/pool")
+async def jevai_pool(limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/jevai/pool?limit={limit}", timeout=30)
+
+
+@router.get("/jevai/keys")
+async def jevai_keys(user=Depends(get_admin_user)):
+    return await gw("/api/admin/jevai/keys", timeout=30)
+
+
+@router.post("/jevai/apply")
+async def jevai_apply(user=Depends(get_admin_user)):
+    """写 data/keys/jevai.{txt,json}，其它工具/线据此接入。"""
+    return await gw("/api/admin/jevai/apply", method="POST", timeout=60)
+
+
+@router.get("/jevai/connect")
+async def jevai_connect(user=Depends(get_admin_user)):
+    return await gw("/api/admin/jevai/connect", timeout=30)
+
+
+@router.post("/jevai/pool/export")
+async def jevai_pool_export(format: str = "keys", download: int = 0, user=Depends(get_admin_user)):
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/jevai/pool/export{query}")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="jevai-keys.{format}"'},
+        )
+    return await gw(f"/api/admin/jevai/pool/export{query}", method="POST", timeout=30)
+
+@router.post("/jevai/checkin")
+async def jevai_checkin(form_data: Optional[dict] = None, user=Depends(get_admin_user)):
+    """给池里每个账号签到（jev 的免费额度主要靠这个）。"""
+    return await gw("/api/admin/jevai/checkin", method="POST", json_body=form_data or {}, timeout=30)
+
+# ---------------------------------------------- 六条 OpenAI 兼容线的通用管理面
+#
+# 一条路径服务六条线：/lines/{line}/{action}。这样面板侧边栏里每条线都有自己的页面，
+# 而后端只有这一份转发代码。
+
+
+class LineRegisterForm(BaseModel):
+    count: int = 1
+    concurrency: int = 1
+    mail_provider: str = "imap"
+    mail_domains: list[str] = []
+    key_name: str = ""
+    proxies: list[str] = []
+    verify_email: bool = True
+    export: Optional[str] = None
+
+
+class LinePoolImportForm(BaseModel):
+    email: str
+    apiKey: str = ""
+    password: str = ""
+    name: str = ""
+    emailVerified: Optional[bool] = None
+    credits: dict = {}
+    mintKey: bool = True
+
+
+@router.get("/lines")
+async def lines_overview(user=Depends(get_admin_user)):
+    """侧边栏/总览：六条线各自的状态与号池计数。"""
+    return await gw("/api/admin/lines", timeout=30)
+
+
+@router.get("/lines/{line}/status")
+async def line_status(line: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/status", timeout=30)
+
+
+@router.post("/lines/{line}/register")
+async def line_register(line: str, form_data: LineRegisterForm, user=Depends(get_admin_user)):
+    body = {
+        "count": form_data.count,
+        "concurrency": form_data.concurrency,
+        "mailProvider": form_data.mail_provider,
+        "mailDomains": form_data.mail_domains,
+        "keyName": form_data.key_name,
+        "proxies": form_data.proxies,
+        "verifyEmail": form_data.verify_email,
+        "export": form_data.export,
+    }
+    return await gw(f"/api/admin/{line}/register", method="POST", json_body=body, timeout=30)
+
+
+@router.post("/lines/{line}/register/stop")
+async def line_register_stop(line: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/register/stop", method="POST", timeout=30)
+
+
+@router.get("/lines/{line}/pool")
+async def line_pool(line: str, limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/pool?limit={limit}", timeout=30)
+
+
+@router.post("/lines/{line}/pool/import")
+async def line_pool_import(line: str, form_data: LinePoolImportForm, user=Depends(get_admin_user)):
+    return await gw(
+        f"/api/admin/{line}/pool/import",
+        method="POST",
+        json_body=form_data.model_dump(),
+        timeout=30,
+    )
+
+
+@router.post("/lines/{line}/pool/export")
+async def line_pool_export(
+    line: str, format: str = "keys", download: int = 0, user=Depends(get_admin_user)
+):
+    query = f"?format={format}" + ("&download=1" if download else "")
+    if download:
+        body, content_type = await gw_raw(f"/api/admin/{line}/pool/export{query}")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{line}-keys.txt"'},
+        )
+    return await gw(f"/api/admin/{line}/pool/export{query}", method="POST", timeout=30)
+
+
+@router.get("/lines/{line}/keys")
+async def line_keys(line: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/keys", timeout=30)
+
+
+@router.post("/lines/{line}/apply")
+async def line_apply(line: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/apply", method="POST", timeout=60)
+
+
+@router.get("/lines/{line}/connect")
+async def line_connect(line: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/connect", timeout=30)
+
+
+@router.delete("/lines/{line}/pool/{account_id}")
+async def line_account_delete(line: str, account_id: str, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/{line}/pool/{account_id}", method="DELETE", timeout=30)
+
+# ------------------------------------------------------ AMD 开发者云（GPU）
+
+class AmdPoolImportForm(BaseModel):
+    email: str
+    apiKey: str = ""
+    credits: dict = {}
+
+
+class AmdStudyForm(BaseModel):
+    email: Optional[str] = None
+    course: Optional[str] = None
+    step: int = 30
+    target: int = 3600
+    pause: float = 1.0
+    maxCalls: int = 400
+    limit: int = 0
+    force: bool = False
+
+
+@router.get("/amd/status")
+async def amd_status(user=Depends(get_admin_user)):
+    return await gw("/api/admin/amd/status", timeout=30)
+
+
+@router.get("/amd/pool")
+async def amd_pool(limit: int = 200, user=Depends(get_admin_user)):
+    return await gw(f"/api/admin/amd/pool?limit={limit}", timeout=30)
+
+
+@router.post("/amd/pool/import")
+async def amd_pool_import(form_data: AmdPoolImportForm, user=Depends(get_admin_user)):
+    """导入浏览器登录后的 cookie（这条线没有自动注册：AMD 账号要手机号 + 人工审批）。"""
+    return await gw("/api/admin/amd/pool/import", method="POST", json_body=form_data.model_dump(), timeout=30)
+
+
+@router.get("/amd/courses")
+async def amd_courses(email: str = "", user=Depends(get_admin_user)):
+    """学院课程列表 + 我们的学习进度。"""
+    query = f"?email={email}" if email else ""
+    return await gw(f"/api/admin/amd/courses{query}", timeout=90)
+
+
+@router.post("/amd/study")
+async def amd_study(form_data: AmdStudyForm, user=Depends(get_admin_user)):
+    """自动刷课：把课程刷到目标进度，攒 Devpoints 换 GPU 小时。"""
+    return await gw("/api/admin/amd/study", method="POST", json_body=form_data.model_dump(), timeout=30)
+
+
+@router.post("/amd/study/stop")
+async def amd_study_stop(user=Depends(get_admin_user)):
+    return await gw("/api/admin/amd/register/stop", method="POST", timeout=30)
+
+
+@router.post("/amd/apply")
+async def amd_apply(user=Depends(get_admin_user)):
+    return await gw("/api/admin/amd/apply", method="POST", timeout=30)
+
+class AmdExamForm(BaseModel):
+    course: str
+    email: Optional[str] = None
+    child: Optional[str] = None
+    auto: bool = True
+    submit: bool = False
+    strategy: str = "first"
+    rounds: int = 3
+
+
+@router.post("/amd/exam")
+async def amd_exam(form_data: AmdExamForm, user=Depends(get_admin_user)):
+    """课程考试：--auto 会自动交卷、捡正确答案、回填重交。"""
+    return await gw("/api/admin/amd/exam", method="POST", json_body=form_data.model_dump(), timeout=30)
+
+class AmdVouchersForm(BaseModel):
+    email: Optional[str] = None
+
+
+class AmdExchangeForm(BaseModel):
+    email: Optional[str] = None
+    amount: int = 1
+    dryRun: bool = False
+    extra: Optional[dict] = None
+
+
+class AmdConsolidateForm(BaseModel):
+    master: Optional[str] = None
+    redeem: bool = False
+    amount: int = 1
+
+
+@router.post("/amd/vouchers")
+async def amd_vouchers(form_data: AmdVouchersForm, user=Depends(get_admin_user)):
+    """算力券汇总：每个号换到多少小时、兑换码、合计。"""
+    return await gw("/api/admin/amd/vouchers", method="POST", json_body=form_data.model_dump(), timeout=30)
+
+
+@router.post("/amd/exchange")
+async def amd_exchange(form_data: AmdExchangeForm, user=Depends(get_admin_user)):
+    return await gw("/api/admin/amd/exchange", method="POST", json_body=form_data.model_dump(), timeout=30)
+
+
+@router.post("/amd/models")
+async def amd_models(user=Depends(get_admin_user)):
+    """免费模型（Token Factory）接入信息：base url + 计费项。"""
+    return await gw("/api/admin/amd/models", method="POST", json_body={}, timeout=60)
+
+
+@router.post("/amd/consolidate")
+async def amd_consolidate(form_data: AmdConsolidateForm, user=Depends(get_admin_user)):
+    """把多号算力券汇总到主号（可选在主号上集中兑换）。"""
+    return await gw("/api/admin/amd/consolidate", method="POST", json_body=form_data.model_dump(), timeout=60)

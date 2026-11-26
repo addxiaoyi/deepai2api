@@ -1,0 +1,42 @@
+# proxyscrape-reg 配置示例
+base_url: https://dashboard.proxyscrape.com
+engine: auto            # auto（协议→浏览器）| protocol | browser
+count: 1
+concurrency: 1          # 试用按出口发，串行最稳
+delay: [20, 55]
+claim_trial: true
+verify_email: true
+output_dir: out
+proxies: []
+
+mail:
+  provider: imap
+  domain: example.com
+  imap_host: imap.example.com
+  imap_port: 993
+  imap_user: catchall@example.com
+  imap_password: ""
+  verify_timeout: 180
+
+captcha:
+  provider: browser     # browser | capsolver | manual | none
+  api_key: ""           # capsolver clientKey，或 manual 的 token
+  timeout: 150
+
+browser:
+  stack: auto
+  headless: true
+  cdp: ""
+  humanize: 1.0
+  geoip: true
+  timeout: 120
+
+antiban:
+  min_delay: 20
+  max_delay: 55
+  per_proxy_concurrency: 1
+  proxy_cooldown: 900
+  max_failures_per_proxy: 2
+
+push_url: ""
+push_token: ""

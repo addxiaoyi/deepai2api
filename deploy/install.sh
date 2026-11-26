@@ -136,11 +136,16 @@ log "installing gateway dependencies (npm ci)"
 ( cd "$INSTALL_DIR" && npm ci --omit=dev --no-audit --no-fund )
 
 log "creating python venv for the signup workers"
+# Turnstile 求解器（可选）：注册页有人机验证的线用它
+if [ -f "$INSTALL_DIR/tools/captcha-solver/requirements.txt" ]; then
+  log "installing captcha-solver extras (optional)"
+  "$VENV_DIR/bin/pip" install -q -r "$INSTALL_DIR/tools/captcha-solver/requirements.txt" || warn "captcha-solver extras failed (optional)"
+fi
 python3 -m venv "$INSTALL_DIR/.venv"
 "$INSTALL_DIR/.venv/bin/pip" install --quiet --upgrade pip
 # 每个 worker 的 requirements 都可能不同（有的带 camoufox，有的只要 httpx）。
 # 逐个装、失败只 warn：一条线的依赖装不上不该拦住整个安装。
-for worker in deepai-reg poe-reg allmodels-reg cleverai-reg gabai-reg zo-reg novita-reg wavespeed-reg blackbox-reg moonai-reg; do
+for worker in deepai-reg poe-reg allmodels-reg cleverai-reg gabai-reg zo-reg novita-reg wavespeed-reg blackbox-reg moonai-reg proxyscrape-reg jevai-reg agnes-reg cerebras-reg opencode-zen-reg requesty-reg unorouter-reg pollinations-reg linekit; do
   req="$INSTALL_DIR/tools/$worker/requirements.txt"
   [ -f "$req" ] || continue
   if "$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$req"; then
@@ -175,6 +180,8 @@ CLEVERAI_PYTHON=${INSTALL_DIR}/.venv/bin/python
 CLEVERAI_REGISTER_DIR=${INSTALL_DIR}/tools/cleverai-reg
 GABAI_PYTHON=${INSTALL_DIR}/.venv/bin/python
 GABAI_REGISTER_DIR=${INSTALL_DIR}/tools/gabai-reg
+PROXYSCRAPE_REGISTER_DIR=${INSTALL_DIR}/tools/proxyscrape-reg
+JEVAIS_REGISTER_DIR=${INSTALL_DIR}/tools/jevai-reg
 EOF
   chmod 600 "$ENV_FILE"
 else

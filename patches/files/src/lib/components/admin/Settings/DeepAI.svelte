@@ -39,6 +39,8 @@
 	import MoonAI from '$lib/components/admin/Settings/MoonAI.svelte';
 	// 六条线的号池总览 + Clever AI Hub / Gab AI 两张卡，挂在本页最底部
 	import Pools from '$lib/components/admin/Settings/Pools.svelte';
+	// 六条 OpenAI 兼容线：每条一个独立页面（左栏是号池列表，等于侧边栏）
+	import LinePools from '$lib/components/admin/Settings/LinePools.svelte';
 
 	const i18n: any = getContext('i18n');
 
@@ -1202,6 +1204,8 @@
 
 <!-- 六条线号池总览 + Clever AI Hub / Gab AI（独立号池与注册机） -->
 <Pools />
+
+<LinePools />
 	</div>
 </div>
 

@@ -4,7 +4,7 @@
 // 组件导入了不存在的函数、面板没挂载"这类错误。Svelte 语法本身由
 // `scripts/validate-svelte.mjs` 负责（真实编译器）。
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -44,6 +44,51 @@ test("router: 总览 + Clever AI + Gab AI 的透传路由都在", () => {
     "POST /gabai/pool/export",
     "DELETE /gabai/pool/{account_id}",
     "GET /gabai/connect",
+    "GET /proxyscrape/status",
+    "POST /proxyscrape/register",
+    "POST /proxyscrape/register/stop",
+    "GET /proxyscrape/pool",
+    "GET /proxyscrape/proxies",
+    "POST /proxyscrape/pool/export",
+    "GET /proxies",
+    "POST /proxies/apply",
+    "GET /lines",
+    "GET /lines/{line}/status",
+    "POST /lines/{line}/register",
+    "POST /lines/{line}/register/stop",
+    "GET /lines/{line}/pool",
+    "POST /lines/{line}/pool/import",
+    "POST /lines/{line}/pool/export",
+    "GET /lines/{line}/keys",
+    "POST /lines/{line}/apply",
+    "GET /lines/{line}/connect",
+    "DELETE /lines/{line}/pool/{account_id}",
+    "GET /amd/status",
+    "GET /amd/pool",
+    "POST /amd/pool/import",
+    "GET /amd/courses",
+    "POST /amd/study",
+    "POST /amd/study/stop",
+    "POST /amd/exam",
+    "POST /amd/vouchers",
+    "POST /amd/exchange",
+    "POST /amd/models",
+    "POST /amd/consolidate",
+    "POST /amd/apply",
+    "GET /jevai/status",
+    "POST /jevai/register",
+    "POST /jevai/register/stop",
+    "GET /jevai/pool",
+    "GET /jevai/keys",
+    "POST /jevai/apply",
+    "GET /jevai/connect",
+    "POST /jevai/checkin",
+    "GET /proxies/formats",
+    "GET /proxies/export",
+    "POST /proxies/check",
+    "GET /proxies/shares",
+    "POST /proxies/share",
+    "DELETE /proxies/shares/{token}",
   ]) {
     assert.ok(routes.includes(expected), `缺少路由 ${expected}`);
   }
@@ -73,7 +118,7 @@ test("router: 表单用 snake_case，转发到网关时转 camelCase", () => {
   }
 });
 
-test("router: /pools 覆盖六条线且字段与 /health 对齐", () => {
+test("router: /pools 覆盖八条线且字段与 /health 对齐", () => {
   const source = read(ROUTER);
   for (const line of ['"deepai"', '"allmodels"', '"poe"', '"cleverai"', '"gabai"']) {
     assert.ok(source.includes(line), `/pools 少了 ${line}`);
@@ -125,10 +170,46 @@ test("panel: 两条线都有启动/停止/导入/导出入口", () => {
     "importGabaiAccount",
     "mintGabaiKey",
     "downloadGabaiPool",
+    "startProxyscrapeRegister",
+    "stopProxyscrapeRegister",
+    "applySharedProxies",
+    "downloadProxyscrapeProxies",
   ]) {
     assert.ok(card.includes(`${fn}(`), `面板缺少 ${fn} 调用`);
   }
   // 轮询要能停：onDestroy 必须清 timer
   assert.ok(card.includes("onDestroy"), "组件没有清理定时器");
   assert.match(card, /clearInterval/);
+});
+
+test("panel: 六条线各有独立页面（LinePools）", () => {
+  const file = join(root, "patches/files/src/lib/components/admin/Settings/LinePools.svelte");
+  assert.ok(existsSync(file), "缺少 LinePools.svelte");
+  const card = readFileSync(file, "utf8");
+
+  for (const fn of [
+    "getLinesOverview",
+    "getLineStatus",
+    "startLineRegister",
+    "stopLineRegister",
+    "getLinePool",
+    "getLineKeys",
+    "applyLine",
+    "getLineConnect",
+    "downloadLineKeys",
+    "deleteLineAccount"
+  ]) {
+    assert.ok(card.includes(fn), `LinePools 缺少 ${fn}`);
+  }
+  // 左栏 = 号池列表，等于侧边栏入口
+  assert.ok(card.includes("lines as row"), "缺号池列表渲染");
+  assert.match(card, /select\(row\.id\)/);
+  // 轮询要能停
+  assert.match(card, /clearInterval/);
+  assert.ok(card.includes("onDestroy"), "组件没有清理定时器");
+
+  // 设置页里必须挂上它
+  const settings = read("patches/files/src/lib/components/admin/Settings/DeepAI.svelte");
+  assert.ok(settings.includes("<LinePools />"), "DeepAI 设置页没挂 LinePools");
+  assert.equal((settings.match(/<LinePools \/>/g) ?? []).length, 1, "只应挂一次");
 });

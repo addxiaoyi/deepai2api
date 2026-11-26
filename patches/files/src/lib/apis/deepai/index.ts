@@ -432,3 +432,217 @@ export const downloadGabaiPool = async (
 	if (!res.ok) throw new Error('导出失败');
 	return res.blob();
 };
+
+/* ------------------------------------------------------- proxyscrape 代理池 */
+
+export type ProxyscrapeRegisterOptions = {
+	count: number;
+	concurrency: number;
+	mail_provider: 'imap' | 'fixed' | 'mailtm' | 'tempmail_lol';
+	mail_domains: string[];
+	captcha: 'browser' | 'capsolver' | 'manual' | 'none';
+	captcha_key?: string | null;
+	engine: 'auto' | 'protocol' | 'browser';
+	browser_stack: 'auto' | 'camoufox' | 'patchright' | 'playwright';
+	proxies: string[];
+	headful: boolean;
+	verify_email: boolean;
+	claim_trial: boolean;
+	export?: 'proxies' | 'jsonl' | 'csv' | null;
+};
+
+export const getProxyscrapeStatus = async (token: string = '') =>
+	request(token, '/proxyscrape/status');
+
+export const startProxyscrapeRegister = async (
+	token: string = '',
+	options: ProxyscrapeRegisterOptions
+) => request(token, '/proxyscrape/register', { method: 'POST', body: JSON.stringify(options) });
+
+export const stopProxyscrapeRegister = async (token: string = '') =>
+	request(token, '/proxyscrape/register/stop', { method: 'POST' });
+
+export const getProxyscrapePool = async (token: string = '', limit: number = 200) =>
+	request(token, `/proxyscrape/pool?limit=${limit}`);
+
+export const getProxyscrapeProxies = async (token: string = '') =>
+	request(token, '/proxyscrape/proxies');
+
+export const applySharedProxies = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/proxies/apply', { method: 'POST', body: JSON.stringify(options) });
+
+export const getProxyShareStatus = async (token: string = '') => request(token, '/proxies');
+
+export const downloadProxyscrapeProxies = async (
+	token: string = '',
+	format: 'proxies' | 'jsonl' | 'csv' = 'proxies'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/proxyscrape/pool/export?format=${format}&download=1`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+/* ------------------------------------------------- 代理导出 / 订阅（别的设备） */
+
+export const getProxyFormats = async (token: string = '') => request(token, '/proxies/formats');
+
+export const exportProxiesAs = async (
+	token: string = '',
+	options: { format?: string; alive?: boolean; limit?: number } = {}
+) => {
+	const format = options.format ?? 'url';
+	const alive = options.alive ? 1 : 0;
+	const limit = options.limit ?? 0;
+	return request(token, `/proxies/export?format=${format}&alive=${alive}&limit=${limit}`);
+};
+
+export const checkProxies = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/proxies/check', { method: 'POST', body: JSON.stringify(options) });
+
+export const listProxyShares = async (token: string = '') => request(token, '/proxies/shares');
+
+export const mintProxyShare = async (
+	token: string = '',
+	options: { name?: string; format?: string; note?: string } = {}
+) => request(token, '/proxies/share', { method: 'POST', body: JSON.stringify(options) });
+
+export const revokeProxyShare = async (token: string = '', shareToken: string, purge = false) =>
+	request(token, `/proxies/shares/${shareToken}?purge=${purge ? 1 : 0}`, { method: 'DELETE' });
+
+export const downloadProxiesAs = async (token: string = '', format: string = 'url') => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/deepai/proxies/export?format=${format}&download=1`,
+		{ headers: { authorization: `Bearer ${token}` } }
+	);
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+/* ------------------------------------------------------- jev-ai.org Key 池 */
+
+export type JevaiRegisterOptions = {
+	count: number;
+	concurrency: number;
+	mail_provider: 'imap' | 'fixed' | 'mailtm' | 'tempmail_lol';
+	mail_domains: string[];
+	key_name?: string;
+	proxies: string[];
+	verify_email: boolean;
+	checkin: boolean;
+	export?: 'keys' | 'jsonl' | 'csv' | null;
+};
+
+export const getJevaiStatus = async (token: string = '') => request(token, '/jevai/status');
+
+export const startJevaiRegister = async (token: string = '', options: JevaiRegisterOptions) =>
+	request(token, '/jevai/register', { method: 'POST', body: JSON.stringify(options) });
+
+export const stopJevaiRegister = async (token: string = '') =>
+	request(token, '/jevai/register/stop', { method: 'POST' });
+
+export const getJevaiPool = async (token: string = '', limit: number = 200) =>
+	request(token, `/jevai/pool?limit=${limit}`);
+
+export const getJevaiKeys = async (token: string = '') => request(token, '/jevai/keys');
+
+export const applyJevai = async (token: string = '') => request(token, '/jevai/apply', { method: 'POST' });
+
+export const getJevaiConnect = async (token: string = '') => request(token, '/jevai/connect');
+
+export const downloadJevaiKeys = async (token: string = '', format: 'keys' | 'jsonl' | 'csv' = 'keys') => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/deepai/jevai/pool/export?format=${format}&download=1`, {
+		headers: { authorization: `Bearer ${token}` }
+	});
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+export const startJevaiCheckin = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/jevai/checkin', { method: 'POST', body: JSON.stringify(options) });
+
+/* -------------------------------------- 六条 OpenAI 兼容线（每条一个页面） */
+
+export type LineRegisterOptions = {
+	count: number;
+	concurrency: number;
+	mail_provider: 'imap' | 'fixed' | 'mailtm' | 'tempmail_lol';
+	mail_domains: string[];
+	key_name?: string;
+	proxies: string[];
+	verify_email: boolean;
+	export?: 'keys' | 'jsonl' | 'csv' | null;
+};
+
+export const getLinesOverview = async (token: string = '') => request(token, '/lines');
+
+export const getLineStatus = async (token: string = '', line: string) =>
+	request(token, `/lines/${line}/status`);
+
+export const startLineRegister = async (token: string = '', line: string, options: LineRegisterOptions) =>
+	request(token, `/lines/${line}/register`, { method: 'POST', body: JSON.stringify(options) });
+
+export const stopLineRegister = async (token: string = '', line: string) =>
+	request(token, `/lines/${line}/register/stop`, { method: 'POST' });
+
+export const getLinePool = async (token: string = '', line: string, limit: number = 200) =>
+	request(token, `/lines/${line}/pool?limit=${limit}`);
+
+export const importLineAccount = async (token: string = '', line: string, account: Record<string, unknown>) =>
+	request(token, `/lines/${line}/pool/import`, { method: 'POST', body: JSON.stringify(account) });
+
+export const getLineKeys = async (token: string = '', line: string) =>
+	request(token, `/lines/${line}/keys`);
+
+export const applyLine = async (token: string = '', line: string) =>
+	request(token, `/lines/${line}/apply`, { method: 'POST' });
+
+export const getLineConnect = async (token: string = '', line: string) =>
+	request(token, `/lines/${line}/connect`);
+
+export const deleteLineAccount = async (token: string = '', line: string, accountId: string) =>
+	request(token, `/lines/${line}/pool/${accountId}`, { method: 'DELETE' });
+
+export const downloadLineKeys = async (token: string = '', line: string, format: 'keys' | 'jsonl' | 'csv' = 'keys') => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/deepai/lines/${line}/pool/export?format=${format}&download=1`, {
+		headers: { authorization: `Bearer ${token}` }
+	});
+	if (!res.ok) throw new Error('导出失败');
+	return res.blob();
+};
+
+
+/* ------------------------------------------------------------ AMD 开发者云 */
+
+export const getAmdStatus = async (token: string = '') => request(token, '/amd/status');
+
+export const getAmdPool = async (token: string = '', limit: number = 200) =>
+	request(token, `/amd/pool?limit=${limit}`);
+
+export const importAmdAccount = async (token: string = '', account: Record<string, unknown>) =>
+	request(token, '/amd/pool/import', { method: 'POST', body: JSON.stringify(account) });
+
+export const getAmdCourses = async (token: string = '', email: string = '') =>
+	request(token, `/amd/courses${email ? `?email=${encodeURIComponent(email)}` : ''}`);
+
+export const startAmdStudy = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/amd/study', { method: 'POST', body: JSON.stringify(options) });
+
+export const applyAmd = async (token: string = '') => request(token, '/amd/apply', { method: 'POST' });
+
+export const startAmdExam = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/amd/exam', { method: 'POST', body: JSON.stringify(options) });
+
+export const getAmdVouchers = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/amd/vouchers', { method: 'POST', body: JSON.stringify(options) });
+
+export const exchangeAmdVoucher = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/amd/exchange', { method: 'POST', body: JSON.stringify(options) });
+
+export const getAmdModels = async (token: string = '') =>
+	request(token, '/amd/models', { method: 'POST', body: '{}' });
+
+export const consolidateAmd = async (token: string = '', options: Record<string, unknown> = {}) =>
+	request(token, '/amd/consolidate', { method: 'POST', body: JSON.stringify(options) });
